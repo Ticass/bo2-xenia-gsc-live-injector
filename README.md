@@ -12,6 +12,8 @@ Current flow:
 
 The tool preserves the stock `_callbacksetup.gsc` template for the selected mode, inserts a thread call to your entry function inside `codecallback_startgametype`, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live `_callbacksetup` GSC object, backs it up, and patches the compiled object in place.
 
+Injection writes are bounded by the live GSC object's own header size field.
+
 ## Default Script
 
 ```gsc
@@ -40,4 +42,3 @@ Documents\BO2 GSC Live Injector\last_injection.json
 ```
 
 The release artifact is written under `release\`.
-

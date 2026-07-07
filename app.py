@@ -19,6 +19,7 @@ GUEST_IMAGE_BASE = 0x82000000
 SIG_AT_0 = bytes.fromhex("4d5a9000")
 SIG_AT_100 = bytes.fromhex("50450000f2011300")
 GSC_OBJ_NAME_FIELD_OFFSET = 0x30
+GSC_OBJ_SIZE_FIELD_OFFSET = 0x24
 GSC_MAGIC = b"\x80GSC"
 
 PROCESS_VM_READ = 0x0010
@@ -330,6 +331,16 @@ def object_name_from_header(mem: GuestMemory, header_va: int) -> str:
     return data[:end].decode("ascii", "replace")
 
 
+def object_size_from_header(mem: GuestMemory, header_va: int) -> int:
+    head = mem.read(header_va, 0x40)
+    if head[:4] != GSC_MAGIC:
+        raise RuntimeError(f"0x{header_va:X} is not a GSC object")
+    size = int.from_bytes(head[GSC_OBJ_SIZE_FIELD_OFFSET:GSC_OBJ_SIZE_FIELD_OFFSET + 4], "big")
+    if not (0x100 <= size <= 0x40000):
+        raise RuntimeError(f"Implausible GSC object size 0x{size:X} at 0x{header_va:X}")
+    return size
+
+
 def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
     basename = target_name.rsplit("/", 1)[-1].encode("ascii")
     headers: set[int] = set()
@@ -347,14 +358,7 @@ def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
         seen = [(hex(h), object_name_from_header(mem, h)) for h in sorted(headers)[:16]]
         raise RuntimeError(f"Could not find loaded {target_name}. Found: {seen}")
     obj_va = matches[0]
-
-    # Estimate writable object span from the next GSC header in the same loaded-script area.
-    all_headers = sorted(h for h in mem.scan(GSC_MAGIC, limit=512) if obj_va <= h < 0xF0000000)
-    next_headers = [h for h in all_headers if h > obj_va]
-    size = (next_headers[0] - obj_va) if next_headers else 0x20000
-    if size > 0x40000:
-        size = 0x40000
-    return obj_va, size
+    return obj_va, object_size_from_header(mem, obj_va)
 
 
 DEFAULT_CODE = """codex_main()
