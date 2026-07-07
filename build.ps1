@@ -15,14 +15,14 @@ py -m PyInstaller `
   --name "BO2GscLiveInjector" `
   --add-data "templates;templates" `
   --add-data "tools;tools" `
-  app.py
+  app_qt.py
 
 $Exe = Join-Path $Root "dist\BO2GscLiveInjector.exe"
 if (-not (Test-Path $Exe)) {
   throw "Build failed; exe not found: $Exe"
 }
 
-$Version = "v0.2.0"
+$Version = "v0.3.0"
 $Zip = Join-Path $Root "release\BO2GscLiveInjector-$Version.zip"
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
 Compress-Archive -Path $Exe, (Join-Path $Root "README.md") -DestinationPath $Zip

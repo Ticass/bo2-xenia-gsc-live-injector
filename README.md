@@ -1,6 +1,6 @@
 # BO2 GSC Live Injector
 
-A small Windows GUI for injecting compiled Xbox 360 Black Ops II GSC into a running Xenia process.
+A BO2-themed Windows GUI for injecting compiled Xbox 360 Black Ops II GSC into a running Xenia process.
 
 Current flow:
 
@@ -14,9 +14,9 @@ The tool preserves the stock `_callbacksetup.gsc` template for the selected mode
 
 Injection writes are bounded by the live GSC object's own header size field.
 
-## Editor
+## Interface
 
-The built-in mini editor includes:
+The PySide6/Qt interface includes:
 
 - Line numbers
 - Current-line highlight
@@ -25,6 +25,10 @@ The built-in mini editor includes:
 - Basic autocomplete with `Ctrl+Space`
 - Snippets for common player/spawn loop patterns
 - Smart indentation on Enter and four-space Tab insertion
+- BO2-style dark/orange theme
+- Target/sidebar controls
+- Live inspector panel for process, target object, object size, and blob size
+- Bottom console log
 
 ## Default Script
 
@@ -50,6 +54,7 @@ Documents\BO2 GSC Live Injector\last_injection.json
 ## Build
 
 ```powershell
+py -m pip install -r requirements.txt
 .\build.ps1
 ```
 
