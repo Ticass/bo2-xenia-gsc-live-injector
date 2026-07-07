@@ -392,10 +392,157 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
 
 DEFAULT_CODE = """codex_main()
 {
+    level thread codex_on_connect();
+}
+
+codex_on_connect()
+{
     for (;;)
     {
+        level waittill( "connecting", player );
+        player thread codex_on_spawn();
+    }
+}
+
+codex_on_spawn()
+{
+    self endon( "disconnect" );
+
+    for (;;)
+    {
+        self waittill( "spawned_player" );
         wait 3;
-        iprintlnbold( "Hello from BO2 GSC Live Injector" );
+
+        self.codex_menu_open = false;
+        self.codex_menu_cursor = 0;
+        self.codex_godmode = false;
+        self.codex_infinite_ammo = false;
+
+        self iprintlnbold( "^2GSC menu loaded^7 - press Dpad Left" );
+        self notify( "codex_menu_restart" );
+        self thread codex_menu_watch();
+        self thread codex_power_loop();
+    }
+}
+
+codex_menu_watch()
+{
+    self endon( "disconnect" );
+    self endon( "codex_menu_restart" );
+
+    for (;;)
+    {
+        if ( self actionslotthreebuttonpressed() )
+        {
+            self.codex_menu_open = !self.codex_menu_open;
+            self codex_draw_menu();
+
+            while ( self actionslotthreebuttonpressed() )
+            {
+                wait .05;
+            }
+        }
+
+        if ( self.codex_menu_open )
+        {
+            if ( self actionslotonebuttonpressed() )
+            {
+                self.codex_menu_cursor--;
+                if ( self.codex_menu_cursor < 0 )
+                {
+                    self.codex_menu_cursor = 1;
+                }
+                self codex_draw_menu();
+                wait .2;
+            }
+
+            if ( self actionslottwobuttonpressed() )
+            {
+                self.codex_menu_cursor++;
+                if ( self.codex_menu_cursor > 1 )
+                {
+                    self.codex_menu_cursor = 0;
+                }
+                self codex_draw_menu();
+                wait .2;
+            }
+
+            if ( self usebuttonpressed() )
+            {
+                if ( self.codex_menu_cursor == 0 )
+                {
+                    self.codex_infinite_ammo = !self.codex_infinite_ammo;
+                }
+                else
+                {
+                    self.codex_godmode = !self.codex_godmode;
+                }
+
+                self codex_draw_menu();
+                wait .25;
+            }
+        }
+
+        wait .05;
+    }
+}
+
+codex_draw_menu()
+{
+    if ( !self.codex_menu_open )
+    {
+        self iprintlnbold( "^1Menu closed" );
+        return;
+    }
+
+    cursor0 = " ";
+    cursor1 = " ";
+
+    if ( self.codex_menu_cursor == 0 )
+    {
+        cursor0 = ">";
+    }
+    else
+    {
+        cursor1 = ">";
+    }
+
+    ammo = "^1OFF";
+    god = "^1OFF";
+
+    if ( self.codex_infinite_ammo )
+    {
+        ammo = "^2ON";
+    }
+
+    if ( self.codex_godmode )
+    {
+        god = "^2ON";
+    }
+
+    self iprintlnbold( "^5MENU^7 Dpad Up/Down + X\\n" + cursor0 + " Infinite Ammo: " + ammo + "\\n" + cursor1 + " Godmode: " + god );
+}
+
+codex_power_loop()
+{
+    self endon( "disconnect" );
+    self endon( "codex_menu_restart" );
+
+    for (;;)
+    {
+        if ( self.codex_godmode )
+        {
+            self.health = 999999;
+            self.maxhealth = 999999;
+        }
+
+        if ( self.codex_infinite_ammo )
+        {
+            weapon = self getcurrentweapon();
+            self givemaxammo( weapon );
+        }
+
+        wait .2;
     }
 }
 """
@@ -413,6 +560,9 @@ GSC_BUILTINS = {
     "precachemodel", "precachestring", "precacheitem", "precachelocationselector",
     "setmodel", "origin", "angles", "health", "maxhealth", "disconnect",
     "spawned_player", "connecting", "level", "self", "player", "players",
+    "actionslotonebuttonpressed", "actionslottwobuttonpressed",
+    "actionslotthreebuttonpressed", "usebuttonpressed", "getcurrentweapon",
+    "givemaxammo",
 }
 
 GSC_SNIPPETS = {
@@ -447,6 +597,7 @@ GSC_SNIPPETS = {
         "    }\n"
         "}\n"
     ),
+    "crude_mod_menu": DEFAULT_CODE,
 }
 
 

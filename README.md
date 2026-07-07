@@ -39,16 +39,15 @@ If you inject a relocated script multiple times in one Xenia session, click `Res
 
 ## Default Script
 
-```gsc
-codex_main()
-{
-    for (;;)
-    {
-        wait 3;
-        iprintlnbold( "Hello from BO2 GSC Live Injector" );
-    }
-}
-```
+The editor opens with a tiny test menu script. On player spawn it prints `GSC menu loaded - press Dpad Left`.
+
+Controls:
+
+- Dpad Left: open or close the menu
+- Dpad Up/Down: move selection
+- X/use: toggle the selected option
+
+The default options are Infinite Ammo and Godmode.
 
 ## Restore
 
