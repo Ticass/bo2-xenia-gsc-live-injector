@@ -14,6 +14,18 @@ The tool preserves the stock `_callbacksetup.gsc` template for the selected mode
 
 Injection writes are bounded by the live GSC object's own header size field.
 
+## Editor
+
+The built-in mini editor includes:
+
+- Line numbers
+- Current-line highlight
+- GSC syntax highlighting
+- String, comment, number, brace, function, keyword, and builtin coloring
+- Basic autocomplete with `Ctrl+Space`
+- Snippets for common player/spawn loop patterns
+- Smart indentation on Enter and four-space Tab insertion
+
 ## Default Script
 
 ```gsc

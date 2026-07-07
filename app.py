@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -11,7 +12,7 @@ import tempfile
 import threading
 from ctypes import wintypes
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, TOP, X, Button, Label, StringVar, Tk, filedialog, messagebox, scrolledtext, ttk
+from tkinter import BOTH, END, INSERT, LEFT, RIGHT, TOP, X, Button, Canvas, Frame, Label, Listbox, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox, scrolledtext, ttk
 
 
 APP_NAME = "BO2 GSC Live Injector"
@@ -372,6 +373,284 @@ DEFAULT_CODE = """codex_main()
 """
 
 
+GSC_KEYWORDS = {
+    "break", "case", "continue", "default", "else", "false", "for", "foreach",
+    "if", "in", "return", "switch", "true", "undefined", "wait", "while",
+}
+
+GSC_BUILTINS = {
+    "iprintln", "iprintlnbold", "println", "thread", "endon", "notify", "waittill",
+    "isdefined", "getentitynumber", "getent", "getentarray", "spawnstruct",
+    "setdvar", "getdvar", "getdvarint", "getdvarfloat", "getdvarvector",
+    "precachemodel", "precachestring", "precacheitem", "precachelocationselector",
+    "setmodel", "origin", "angles", "health", "maxhealth", "disconnect",
+    "spawned_player", "connecting", "level", "self", "player", "players",
+}
+
+GSC_SNIPPETS = {
+    "loop_spawn_message": (
+        "codex_main()\n"
+        "{\n"
+        "    for (;;)\n"
+        "    {\n"
+        "        wait 3;\n"
+        "        iprintlnbold( \"Hello from GSC\" );\n"
+        "    }\n"
+        "}\n"
+    ),
+    "on_player_connect": (
+        "on_player_connect()\n"
+        "{\n"
+        "    for (;;)\n"
+        "    {\n"
+        "        level waittill( \"connecting\", player );\n"
+        "        player thread on_player_spawned();\n"
+        "    }\n"
+        "}\n"
+    ),
+    "on_player_spawned": (
+        "on_player_spawned()\n"
+        "{\n"
+        "    self endon( \"disconnect\" );\n\n"
+        "    for (;;)\n"
+        "    {\n"
+        "        self waittill( \"spawned_player\" );\n"
+        "        wait 3;\n"
+        "    }\n"
+        "}\n"
+    ),
+}
+
+
+class GscEditor:
+    def __init__(self, master) -> None:
+        self.frame = Frame(master, bg="#151515")
+        self.gutter = Canvas(self.frame, width=54, highlightthickness=0, bg="#202225")
+        self.text = Text(
+            self.frame,
+            undo=True,
+            wrap="none",
+            font=("Consolas", 11),
+            bg="#151515",
+            fg="#D8DEE9",
+            insertbackground="#FFFFFF",
+            selectbackground="#365C7D",
+            borderwidth=0,
+            padx=10,
+            pady=8,
+        )
+        self.scroll_y = Scrollbar(self.frame, orient="vertical", command=self._yview)
+        self.scroll_x = Scrollbar(self.frame, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=self._on_yscroll, xscrollcommand=self.scroll_x.set)
+
+        self.gutter.pack(side=LEFT, fill="y")
+        self.scroll_y.pack(side=RIGHT, fill="y")
+        self.scroll_x.pack(side="bottom", fill=X)
+        self.text.pack(side=LEFT, fill=BOTH, expand=True)
+
+        self.popup: Toplevel | None = None
+        self.popup_list: Listbox | None = None
+        self.highlight_job: str | None = None
+        self.completions = sorted(GSC_KEYWORDS | GSC_BUILTINS | set(GSC_SNIPPETS))
+        self._configure_tags()
+        self._bind_events()
+
+    def pack(self, *args, **kwargs) -> None:
+        self.frame.pack(*args, **kwargs)
+
+    def get(self, *args, **kwargs) -> str:
+        return self.text.get(*args, **kwargs)
+
+    def insert(self, *args, **kwargs) -> None:
+        self.text.insert(*args, **kwargs)
+        self.schedule_highlight()
+
+    def _configure_tags(self) -> None:
+        self.text.tag_configure("current_line", background="#1C2430")
+        self.text.tag_configure("keyword", foreground="#C792EA")
+        self.text.tag_configure("builtin", foreground="#82AAFF")
+        self.text.tag_configure("string", foreground="#C3E88D")
+        self.text.tag_configure("comment", foreground="#697098")
+        self.text.tag_configure("number", foreground="#F78C6C")
+        self.text.tag_configure("function", foreground="#FFCB6B")
+        self.text.tag_configure("brace", foreground="#89DDFF")
+
+    def _bind_events(self) -> None:
+        self.text.bind("<KeyRelease>", self._on_key_release)
+        self.text.bind("<ButtonRelease-1>", lambda _e: self.refresh())
+        self.text.bind("<MouseWheel>", lambda _e: self.frame.after_idle(self.refresh))
+        self.text.bind("<Return>", self._smart_return)
+        self.text.bind("<Tab>", self._tab_or_complete)
+        self.text.bind("<Control-space>", lambda _e: (self.show_completions(force=True), "break")[1])
+        self.text.bind("<Escape>", lambda _e: (self.hide_popup(), None)[1])
+        self.text.bind("<Configure>", lambda _e: self.refresh())
+
+    def _on_yscroll(self, first: str, last: str) -> None:
+        self.scroll_y.set(first, last)
+        self.draw_line_numbers()
+
+    def _yview(self, *args) -> None:
+        self.text.yview(*args)
+        self.draw_line_numbers()
+
+    def _on_key_release(self, event) -> None:
+        if event.keysym in {"Up", "Down", "Left", "Right", "Return", "Tab", "Escape"}:
+            self.refresh()
+            return
+        self.schedule_highlight()
+        self.update_current_line()
+        self.show_completions()
+
+    def _smart_return(self, _event):
+        line = self.text.get("insert linestart", "insert")
+        indent = re.match(r"\s*", line).group(0)
+        extra = "    " if line.rstrip().endswith("{") else ""
+        self.text.insert(INSERT, "\n" + indent + extra)
+        self.schedule_highlight()
+        return "break"
+
+    def _tab_or_complete(self, _event):
+        if self.popup and self.popup.winfo_exists():
+            self.apply_completion()
+            return "break"
+        self.text.insert(INSERT, "    ")
+        self.schedule_highlight()
+        return "break"
+
+    def refresh(self) -> None:
+        self.draw_line_numbers()
+        self.update_current_line()
+
+    def schedule_highlight(self) -> None:
+        if self.highlight_job:
+            self.text.after_cancel(self.highlight_job)
+        self.highlight_job = self.text.after(120, self.highlight)
+        self.refresh()
+
+    def update_current_line(self) -> None:
+        self.text.tag_remove("current_line", "1.0", END)
+        self.text.tag_add("current_line", "insert linestart", "insert lineend+1c")
+        self.text.tag_lower("current_line")
+
+    def draw_line_numbers(self) -> None:
+        self.gutter.delete("all")
+        index = self.text.index("@0,0")
+        while True:
+            dline = self.text.dlineinfo(index)
+            if dline is None:
+                break
+            y = dline[1]
+            line = index.split(".")[0]
+            self.gutter.create_text(44, y + 8, anchor="e", text=line, fill="#858B98", font=("Consolas", 10))
+            index = self.text.index(f"{index}+1line")
+
+    def highlight(self) -> None:
+        self.highlight_job = None
+        content = self.text.get("1.0", "end-1c")
+        for tag in ("keyword", "builtin", "string", "comment", "number", "function", "brace"):
+            self.text.tag_remove(tag, "1.0", END)
+
+        self._highlight_regex(content, r'"(?:\\.|[^"\\])*"', "string")
+        self._highlight_regex(content, r"//.*", "comment")
+        self._highlight_regex(content, r"/#.*?#/", "comment", flags=re.DOTALL)
+        self._highlight_regex(content, r"\b(?:0x[0-9A-Fa-f]+|\d+(?:\.\d+)?)\b", "number")
+        self._highlight_regex(content, r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()", "function", group=1)
+        self._highlight_regex(content, r"[{}\[\]();]", "brace")
+
+        words = sorted(GSC_KEYWORDS | GSC_BUILTINS, key=len, reverse=True)
+        self._highlight_regex(content, r"\b(" + "|".join(map(re.escape, words)) + r")\b", "keyword_or_builtin", group=1)
+        self.text.tag_remove("keyword_or_builtin", "1.0", END)
+
+        for word in GSC_KEYWORDS:
+            self._highlight_word(word, "keyword")
+        for word in GSC_BUILTINS:
+            self._highlight_word(word, "builtin")
+        self.refresh()
+
+    def _offset_to_index(self, offset: int) -> str:
+        return f"1.0+{offset}c"
+
+    def _highlight_regex(self, content: str, pattern: str, tag: str, group: int = 0, flags: int = 0) -> None:
+        if tag == "keyword_or_builtin":
+            return
+        for match in re.finditer(pattern, content, flags):
+            start, end = match.span(group)
+            self.text.tag_add(tag, self._offset_to_index(start), self._offset_to_index(end))
+
+    def _highlight_word(self, word: str, tag: str) -> None:
+        start = "1.0"
+        while True:
+            idx = self.text.search(rf"\m{word}\M", start, END, regexp=True)
+            if not idx:
+                break
+            end = f"{idx}+{len(word)}c"
+            self.text.tag_add(tag, idx, end)
+            start = end
+
+    def current_prefix(self) -> tuple[str, str]:
+        before = self.text.get("insert linestart", INSERT)
+        match = re.search(r"[A-Za-z_][A-Za-z0-9_]*$", before)
+        if not match:
+            return "", INSERT
+        start = f"insert-{len(match.group(0))}c"
+        return match.group(0), start
+
+    def show_completions(self, force: bool = False) -> None:
+        prefix, _start = self.current_prefix()
+        if not force and len(prefix) < 2:
+            self.hide_popup()
+            return
+        matches = [item for item in self.completions if item.lower().startswith(prefix.lower())]
+        if not matches:
+            self.hide_popup()
+            return
+        if self.popup is None or not self.popup.winfo_exists():
+            self.popup = Toplevel(self.text)
+            self.popup.wm_overrideredirect(True)
+            self.popup.configure(bg="#2B303B")
+            self.popup_list = Listbox(
+                self.popup,
+                height=min(9, len(matches)),
+                bg="#2B303B",
+                fg="#D8DEE9",
+                selectbackground="#365C7D",
+                activestyle="none",
+                font=("Consolas", 10),
+            )
+            self.popup_list.pack(fill=BOTH, expand=True)
+            self.popup_list.bind("<Double-Button-1>", lambda _e: self.apply_completion())
+            self.popup_list.bind("<Return>", lambda _e: self.apply_completion())
+        self.popup_list.delete(0, END)
+        for item in matches[:12]:
+            self.popup_list.insert(END, item)
+        self.popup_list.selection_set(0)
+        bbox = self.text.bbox(INSERT)
+        if bbox:
+            x = self.text.winfo_rootx() + bbox[0]
+            y = self.text.winfo_rooty() + bbox[1] + bbox[3] + 2
+            self.popup.geometry(f"+{x}+{y}")
+
+    def apply_completion(self) -> None:
+        if not self.popup_list:
+            return
+        selection = self.popup_list.curselection()
+        if not selection:
+            return
+        value = self.popup_list.get(selection[0])
+        prefix, start = self.current_prefix()
+        self.text.delete(start, INSERT)
+        snippet = GSC_SNIPPETS.get(value)
+        self.text.insert(INSERT, snippet if snippet else value)
+        self.hide_popup()
+        self.schedule_highlight()
+
+    def hide_popup(self) -> None:
+        if self.popup and self.popup.winfo_exists():
+            self.popup.destroy()
+        self.popup = None
+        self.popup_list = None
+
+
 class InjectorApp:
     def __init__(self) -> None:
         self.root = Tk()
@@ -396,7 +675,7 @@ class InjectorApp:
         Button(top, text="Open Build Folder", command=self.open_build_folder).pack(side=RIGHT, padx=4)
 
         Label(self.root, textvariable=self.status, anchor="w").pack(fill=X, padx=8)
-        self.editor = scrolledtext.ScrolledText(self.root, height=24, undo=True, font=("Consolas", 11))
+        self.editor = GscEditor(self.root)
         self.editor.pack(fill=BOTH, expand=True, padx=8, pady=(4, 6))
         self.editor.insert("1.0", DEFAULT_CODE)
 
