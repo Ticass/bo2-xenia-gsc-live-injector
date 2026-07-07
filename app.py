@@ -520,7 +520,7 @@ codex_draw_menu()
         god = "^2ON";
     }
 
-    self iprintlnbold( "^5MENU^7 Dpad Up/Down + X\\n" + cursor0 + " Infinite Ammo: " + ammo + "\\n" + cursor1 + " Godmode: " + god );
+    self iprintlnbold( "^5MENU^7 " + cursor0 + "Ammo:" + ammo + " ^7| " + cursor1 + "God:" + god + " ^7| X Toggle" );
 }
 
 codex_power_loop()

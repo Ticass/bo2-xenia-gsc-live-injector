@@ -48,6 +48,7 @@ Controls:
 - X/use: toggle the selected option
 
 The default options are Infinite Ammo and Godmode.
+The menu renders as one compact bold line so it works with BO2's single-line bold print behavior.
 
 ## Restore
 
