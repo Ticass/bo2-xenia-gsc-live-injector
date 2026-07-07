@@ -362,6 +362,34 @@ def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
     return obj_va, object_size_from_header(mem, obj_va)
 
 
+def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
+    obj_va, obj_size = find_live_gsc_object(mem, target_name)
+    refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=128) if r < 0x90000000 and (r & 3) == 0]
+    candidates: list[dict] = []
+    for ref in refs:
+        try:
+            size = mem.read_u32(ref - 4)
+            name_ptr = mem.read_u32(ref - 8)
+        except OSError:
+            continue
+        if size == obj_size and 0x80000000 <= name_ptr < 0xF0000000:
+            candidates.append(
+                {
+                    "entry_va": ref - 8,
+                    "name_ptr_va": ref - 8,
+                    "size_va": ref - 4,
+                    "buffer_va": ref,
+                    "name_ptr": name_ptr,
+                    "object_va": obj_va,
+                    "object_size": obj_size,
+                }
+            )
+    if not candidates:
+        raise RuntimeError(f"Found {target_name} object at 0x{obj_va:X}, but no live table entry references it.")
+    candidates.sort(key=lambda c: (0 if 0x83000000 <= c["entry_va"] < 0x85000000 else 1, c["entry_va"]))
+    return candidates[0]
+
+
 DEFAULT_CODE = """codex_main()
 {
     for (;;)

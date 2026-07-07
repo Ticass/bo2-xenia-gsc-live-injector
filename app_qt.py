@@ -43,6 +43,8 @@ TEXT = "#dce2ea"
 MUTED = "#8b949e"
 GREEN = "#52d273"
 RED = "#ff5a5f"
+FREE_GSC_BUFFER = 0x40300000
+MAX_RELOCATED_BLOB_SIZE = 0x200000
 
 
 class WorkerSignals(QObject):
@@ -338,7 +340,7 @@ class InjectorWindow(QMainWindow):
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
         self.info_labels: dict[str, QLabel] = {}
-        for key in ["Process", "Target", "Object", "Size", "Blob"]:
+        for key in ["Process", "Target", "Mode", "Entry", "Object", "Buffer", "Size", "Blob"]:
             k = QLabel(key.upper())
             k.setObjectName("Hint")
             v = QLabel("-")
@@ -417,9 +419,21 @@ class InjectorWindow(QMainWindow):
         try:
             info = mem.open()
             target = "maps/mp/gametypes_zm/_callbacksetup.gsc" if self.game_type.currentText() == "ZM" else "maps/mp/gametypes/_callbacksetup.gsc"
-            obj, size = backend.find_live_gsc_object(mem, target)
-            self.signals.log.emit(f"{info}\nFound {target}\nobject=0x{obj:X}, size=0x{size:X}")
-            self.signals.info.emit({"Process": info, "Target": target, "Object": f"0x{obj:X}", "Size": f"0x{size:X}"})
+            entry = backend.find_live_gsc_entry(mem, target)
+            self.signals.log.emit(
+                f"{info}\nFound {target}\n"
+                f"entry=0x{entry['entry_va']:X}, object=0x{entry['object_va']:X}, size=0x{entry['object_size']:X}"
+            )
+            self.signals.info.emit(
+                {
+                    "Process": info,
+                    "Target": target,
+                    "Entry": f"0x{entry['entry_va']:X}",
+                    "Object": f"0x{entry['object_va']:X}",
+                    "Buffer": f"0x{entry['object_va']:X}",
+                    "Size": f"0x{entry['object_size']:X}",
+                }
+            )
         finally:
             mem.close()
 
@@ -440,30 +454,68 @@ class InjectorWindow(QMainWindow):
         mem = backend.GuestMemory()
         try:
             info = mem.open()
-            obj, size = backend.find_live_gsc_object(mem, target)
-            if len(blob) > size:
-                raise RuntimeError(f"Compiled blob too large: 0x{len(blob):X} > 0x{size:X}")
-            backup = mem.read(obj, size)
-            backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
-            backup_path.write_bytes(backup)
-            mem.write(obj, blob + (b"\x00" * (size - len(blob))))
-            cfg = {
-                "target_gsc": target,
-                "object_va": f"0x{obj:X}",
-                "object_size": f"0x{size:X}",
-                "backup_file": str(backup_path),
-                "compiled_file": str(compiled_path),
-                "script_len": f"0x{len(blob):X}",
-            }
+            live_entry = backend.find_live_gsc_entry(mem, target)
+            obj = live_entry["object_va"]
+            size = live_entry["object_size"]
+            if len(blob) <= size:
+                backup = mem.read(obj, size)
+                backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
+                backup_path.write_bytes(backup)
+                mem.write(obj, blob + (b"\x00" * (size - len(blob))))
+                mode = "in-place"
+                cfg = {
+                    "mode": "inplace",
+                    "target_gsc": target,
+                    "object_va": f"0x{obj:X}",
+                    "object_size": f"0x{size:X}",
+                    "backup_file": str(backup_path),
+                    "compiled_file": str(compiled_path),
+                    "script_len": f"0x{len(blob):X}",
+                }
+                buffer_va = obj
+            else:
+                if len(blob) > MAX_RELOCATED_BLOB_SIZE:
+                    raise RuntimeError(
+                        f"Compiled blob is too large for the relocation buffer: "
+                        f"0x{len(blob):X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}"
+                    )
+                buffer_va = FREE_GSC_BUFFER
+                mem.write(buffer_va, blob)
+                mem.write(live_entry["size_va"], len(blob).to_bytes(4, "big"))
+                mem.write(live_entry["buffer_va"], buffer_va.to_bytes(4, "big"))
+                mode = "relocated"
+                cfg = {
+                    "mode": "relocated",
+                    "target_gsc": target,
+                    "entry_va": f"0x{live_entry['entry_va']:X}",
+                    "size_va": f"0x{live_entry['size_va']:X}",
+                    "buffer_va": f"0x{live_entry['buffer_va']:X}",
+                    "old_size": f"0x{size:X}",
+                    "old_buffer": f"0x{obj:X}",
+                    "new_size": f"0x{len(blob):X}",
+                    "new_buffer": f"0x{buffer_va:X}",
+                    "object_va": f"0x{obj:X}",
+                    "object_size": f"0x{size:X}",
+                    "compiled_file": str(compiled_path),
+                    "script_len": f"0x{len(blob):X}",
+                }
             cfg_path = backend.user_dir() / "last_injection.json"
             cfg_path.write_text(json.dumps(cfg, indent=2))
             self.restore_cfg = cfg_path
-            self.signals.log.emit(f"{info}\nInjected {target}\nobject=0x{obj:X}, size=0x{size:X}, blob=0x{len(blob):X}\nLoad/restart the map.")
+            self.signals.log.emit(
+                f"{info}\nInjected {target} ({mode})\n"
+                f"entry=0x{live_entry['entry_va']:X}, object=0x{obj:X}, buffer=0x{buffer_va:X}, "
+                f"object_size=0x{size:X}, blob=0x{len(blob):X}\n"
+                f"Load/restart the map."
+            )
             self.signals.info.emit(
                 {
                     "Process": info,
                     "Target": target,
+                    "Mode": mode,
+                    "Entry": f"0x{live_entry['entry_va']:X}",
                     "Object": f"0x{obj:X}",
+                    "Buffer": f"0x{buffer_va:X}",
                     "Size": f"0x{size:X}",
                     "Blob": f"0x{len(blob):X}",
                 }
@@ -479,12 +531,20 @@ class InjectorWindow(QMainWindow):
         if not cfg_path.exists():
             raise RuntimeError("No last_injection.json found.")
         cfg = json.loads(cfg_path.read_text())
-        backup = Path(cfg["backup_file"]).read_bytes()
         mem = backend.GuestMemory()
         try:
             info = mem.open()
-            mem.write(int(cfg["object_va"], 16), backup)
-            self.signals.log.emit(f"{info}\nRestored {cfg['target_gsc']} at {cfg['object_va']}.")
+            if cfg.get("mode") == "relocated":
+                mem.write(int(cfg["size_va"], 16), int(cfg["old_size"], 16).to_bytes(4, "big"))
+                mem.write(int(cfg["buffer_va"], 16), int(cfg["old_buffer"], 16).to_bytes(4, "big"))
+                self.signals.log.emit(
+                    f"{info}\nRestored {cfg['target_gsc']} table entry "
+                    f"to buffer={cfg['old_buffer']}, size={cfg['old_size']}."
+                )
+            else:
+                backup = Path(cfg["backup_file"]).read_bytes()
+                mem.write(int(cfg["object_va"], 16), backup)
+                self.signals.log.emit(f"{info}\nRestored {cfg['target_gsc']} at {cfg['object_va']}.")
         finally:
             mem.close()
 

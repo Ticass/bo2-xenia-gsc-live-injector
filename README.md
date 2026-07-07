@@ -10,9 +10,9 @@ Current flow:
 4. Click `Compile + Inject`.
 5. Load or restart the map.
 
-The tool preserves the stock `_callbacksetup.gsc` template for the selected mode, inserts a thread call to your entry function inside `codecallback_startgametype`, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live `_callbacksetup` GSC object, backs it up, and patches the compiled object in place.
+The tool preserves the stock `_callbacksetup.gsc` template for the selected mode, inserts a thread call to your entry function inside `codecallback_startgametype`, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live `_callbacksetup` GSC object, and injects the compiled object.
 
-Injection writes are bounded by the live GSC object's own header size field.
+Small compiled scripts are written in place after backing up the original object. Larger compiled scripts are relocated to a free guest-memory buffer and the live GSC table entry is patched to point at the relocated object, including its new size.
 
 ## Interface
 
@@ -27,8 +27,15 @@ The PySide6/Qt interface includes:
 - Smart indentation on Enter and four-space Tab insertion
 - BO2-style dark/orange theme
 - Target/sidebar controls
-- Live inspector panel for process, target object, object size, and blob size
+- Live inspector panel for process, target object, table entry, active buffer, object size, and blob size
 - Bottom console log
+
+## Injection Modes
+
+- `in-place`: used when the compiled blob fits inside the loaded `_callbacksetup.gsc` object. Restore writes the original object backup back into memory.
+- `relocated`: used when the compiled blob is larger than the loaded object. The blob is written to `0x40300000`, then the live GSC table entry's size and buffer pointer are updated. Restore puts the table entry back to the original object pointer and size.
+
+If you inject a relocated script multiple times in one Xenia session, click `Restore Backup` first or restart Xenia before injecting again.
 
 ## Default Script
 
