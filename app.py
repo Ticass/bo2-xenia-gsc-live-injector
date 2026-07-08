@@ -18,7 +18,7 @@ from tkinter import BOTH, END, INSERT, LEFT, RIGHT, TOP, X, Button, Canvas, Fram
 APP_NAME = "BO2 GSC Live Injector"
 GUEST_IMAGE_BASE = 0x82000000
 SIG_AT_0 = bytes.fromhex("4d5a9000")
-SIG_AT_100 = bytes.fromhex("50450000f2011300")
+PE_SIG = bytes.fromhex("50450000")
 GSC_OBJ_NAME_FIELD_OFFSET = 0x30
 GSC_OBJ_SIZE_FIELD_OFFSET = 0x24
 GSC_MAGIC = b"\x80GSC"
@@ -108,14 +108,25 @@ class GuestMemory:
         matches = [(pid, exe) for pid, exe in list_processes() if "xenia" in exe.lower()]
         if not matches:
             raise RuntimeError("No Xenia process found.")
-        self.pid, self.exe_name = matches[0]
         access = PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION
-        self.handle = k32.OpenProcess(access, False, self.pid)
-        if not self.handle:
-            raise OSError(f"OpenProcess({self.pid}) failed. Run as Administrator.")
-        self.membase = self._find_membase()
+        errors: list[str] = []
+        for pid, exe in matches:
+            handle = k32.OpenProcess(access, False, pid)
+            if not handle:
+                errors.append(f"{exe} pid={pid}: OpenProcess failed")
+                continue
+            self.pid, self.exe_name, self.handle = pid, exe, handle
+            self.membase = self._find_membase()
+            if self.membase is not None:
+                break
+            errors.append(f"{exe} pid={pid}: no Xbox guest image found")
+            k32.CloseHandle(handle)
+            self.handle = None
+            self.pid = None
+            self.exe_name = ""
         if self.membase is None:
-            raise RuntimeError("Xenia found, but CoD/guest memory is not mapped yet.")
+            detail = "; ".join(errors) if errors else "no readable Xenia processes"
+            raise RuntimeError(f"Xenia found, but CoD/guest memory is not mapped yet. Checked: {detail}")
         return f"{self.exe_name} pid={self.pid}, guest membase=0x{self.membase:X}"
 
     def _raw_read(self, host_addr: int, size: int) -> bytes | None:
@@ -147,7 +158,7 @@ class GuestMemory:
 
         for base, _size in regions:
             head = self._raw_read(base, 0x108)
-            if head and head[:4] == SIG_AT_0 and head[0x100:0x108] == SIG_AT_100:
+            if head and head[:4] == SIG_AT_0 and head[0x100:0x104] == PE_SIG:
                 return base - GUEST_IMAGE_BASE
         for base, size in regions:
             if size < 0x8000000:
@@ -155,7 +166,7 @@ class GuestMemory:
             for guest_start in (0, 0x80000000):
                 cand = base - guest_start
                 probe = self._raw_read(cand + GUEST_IMAGE_BASE, 0x108)
-                if probe and probe[:4] == SIG_AT_0 and probe[0x100:0x108] == SIG_AT_100:
+                if probe and probe[:4] == SIG_AT_0 and probe[0x100:0x104] == PE_SIG:
                     return cand
         return None
 

@@ -11,6 +11,7 @@ Current flow:
 5. Load or restart the map.
 
 The tool preserves the stock `_callbacksetup.gsc` template for the selected mode, inserts a thread call to your entry function inside `codecallback_startgametype`, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live `_callbacksetup` GSC object, and injects the compiled object.
+When multiple Xenia processes are open, the injector checks each one and connects to the process that actually has an Xbox guest image mapped.
 
 Small compiled scripts are written in place after backing up the original object. Larger compiled scripts are relocated to a free guest-memory buffer and the live GSC table entry is patched to point at the relocated object, including its new size.
 Compiled objects are normalized after the internal script name is added so the GSC header size fields match the final blob length before injection.
