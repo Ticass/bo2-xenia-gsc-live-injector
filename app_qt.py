@@ -449,6 +449,7 @@ class InjectorWindow(QMainWindow):
         source, target = backend.patch_template(target_mode, code, entry)
         self.signals.log.emit(f"Compiling {target}...")
         blob = backend.run_gsc_tool_compile(source, target)
+        blob_size = backend.object_size_from_blob(blob)
         compiled_path = backend.user_dir() / "build" / f"{target_mode.lower()}_callbacksetup_injected.gsc"
         compiled_path.write_bytes(blob)
         mem = backend.GuestMemory()
@@ -457,7 +458,7 @@ class InjectorWindow(QMainWindow):
             live_entry = backend.find_live_gsc_entry(mem, target)
             obj = live_entry["object_va"]
             size = live_entry["object_size"]
-            if len(blob) <= size:
+            if blob_size <= size:
                 backup = mem.read(obj, size)
                 backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
                 backup_path.write_bytes(backup)
@@ -470,18 +471,20 @@ class InjectorWindow(QMainWindow):
                     "object_size": f"0x{size:X}",
                     "backup_file": str(backup_path),
                     "compiled_file": str(compiled_path),
-                    "script_len": f"0x{len(blob):X}",
+                    "script_len": f"0x{blob_size:X}",
+                    "file_len": f"0x{len(blob):X}",
                 }
                 buffer_va = obj
             else:
-                if len(blob) > MAX_RELOCATED_BLOB_SIZE:
+                if blob_size > MAX_RELOCATED_BLOB_SIZE:
                     raise RuntimeError(
                         f"Compiled blob is too large for the relocation buffer: "
-                        f"0x{len(blob):X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}"
+                        f"0x{blob_size:X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}"
                     )
                 buffer_va = FREE_GSC_BUFFER
+                mem.write(buffer_va, b"\x00" * len(blob))
                 mem.write(buffer_va, blob)
-                mem.write(live_entry["size_va"], len(blob).to_bytes(4, "big"))
+                mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
                 mem.write(live_entry["buffer_va"], buffer_va.to_bytes(4, "big"))
                 mode = "relocated"
                 cfg = {
@@ -492,12 +495,13 @@ class InjectorWindow(QMainWindow):
                     "buffer_va": f"0x{live_entry['buffer_va']:X}",
                     "old_size": f"0x{size:X}",
                     "old_buffer": f"0x{obj:X}",
-                    "new_size": f"0x{len(blob):X}",
+                    "new_size": f"0x{blob_size:X}",
                     "new_buffer": f"0x{buffer_va:X}",
                     "object_va": f"0x{obj:X}",
                     "object_size": f"0x{size:X}",
                     "compiled_file": str(compiled_path),
-                    "script_len": f"0x{len(blob):X}",
+                    "script_len": f"0x{blob_size:X}",
+                    "file_len": f"0x{len(blob):X}",
                 }
             cfg_path = backend.user_dir() / "last_injection.json"
             cfg_path.write_text(json.dumps(cfg, indent=2))
@@ -505,7 +509,7 @@ class InjectorWindow(QMainWindow):
             self.signals.log.emit(
                 f"{info}\nInjected {target} ({mode})\n"
                 f"entry=0x{live_entry['entry_va']:X}, object=0x{obj:X}, buffer=0x{buffer_va:X}, "
-                f"object_size=0x{size:X}, blob=0x{len(blob):X}\n"
+                f"object_size=0x{size:X}, blob=0x{blob_size:X}, file=0x{len(blob):X}\n"
                 f"Load/restart the map."
             )
             self.signals.info.emit(
@@ -517,7 +521,7 @@ class InjectorWindow(QMainWindow):
                     "Object": f"0x{obj:X}",
                     "Buffer": f"0x{buffer_va:X}",
                     "Size": f"0x{size:X}",
-                    "Blob": f"0x{len(blob):X}",
+                    "Blob": f"0x{blob_size:X}",
                 }
             )
         finally:

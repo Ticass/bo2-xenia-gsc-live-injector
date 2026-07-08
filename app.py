@@ -250,13 +250,24 @@ def ensure_gsc_object_name(bytecode: bytes, name: str) -> bytes:
         end = buf.find(b"\x00", name_off)
         if end >= 0:
             current = bytes(buf[name_off:end])
-    if current == want:
-        return bytecode
-    if len(buf) > 0xFFFF:
-        return bytecode
-    struct.pack_into(">H", buf, GSC_OBJ_NAME_FIELD_OFFSET, len(buf))
-    buf += want + b"\x00"
+    if current != want:
+        if len(buf) > 0xFFFF:
+            return bytecode
+        struct.pack_into(">H", buf, GSC_OBJ_NAME_FIELD_OFFSET, len(buf))
+        buf += want + b"\x00"
+    final_size = len(buf)
+    struct.pack_into(">I", buf, GSC_OBJ_SIZE_FIELD_OFFSET, final_size)
+    struct.pack_into(">I", buf, GSC_OBJ_SIZE_FIELD_OFFSET + 4, final_size)
     return bytes(buf)
+
+
+def object_size_from_blob(bytecode: bytes) -> int:
+    if len(bytecode) < 0x2C or bytecode[:4] != GSC_MAGIC:
+        return len(bytecode)
+    size = int.from_bytes(bytecode[GSC_OBJ_SIZE_FIELD_OFFSET:GSC_OBJ_SIZE_FIELD_OFFSET + 4], "big")
+    if 0x100 <= size <= len(bytecode):
+        return size
+    return len(bytecode)
 
 
 def run_gsc_tool_compile(source: Path, output_name: str) -> bytes:
