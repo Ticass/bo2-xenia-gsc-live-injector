@@ -39,6 +39,10 @@ The PySide6/Qt interface includes:
 
 If you inject a relocated script multiple times in one Xenia session, click `Restore Backup` first or restart Xenia before injecting again.
 
+## Notes
+
+- [Shader HUD notes](docs/shader_hud_notes.md)
+
 ## Default Script
 
 The editor opens with a tiny test menu script. On player spawn it prints `GSC menu loaded - press Dpad Left`.
