@@ -32,6 +32,7 @@ PAGE_GUARD = 0x100
 PAGE_NOACCESS = 0x01
 PAGE_READWRITE = 0x04
 TH32CS_SNAPPROCESS = 0x2
+XENIA_LINEAR_BASE_CANDIDATES = (0x100000000,)
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
@@ -137,6 +138,43 @@ class GuestMemory:
             return None
         return buf.raw
 
+    def _is_readable_host_range(self, host_addr: int, size: int) -> bool:
+        mbi = MEMORY_BASIC_INFORMATION()
+        end = host_addr + size
+        addr = host_addr
+        while addr < end:
+            res = k32.VirtualQueryEx(self.handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
+            if not res:
+                return False
+            base = mbi.BaseAddress or 0
+            region_size = mbi.RegionSize or 0
+            readable = mbi.State == MEM_COMMIT and not (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) and mbi.Protect != 0
+            if not readable or addr < base:
+                return False
+            nxt = base + region_size
+            if nxt <= addr:
+                return False
+            addr = nxt
+        return True
+
+    def _host_candidates_for_guest(self, guest_va: int) -> list[int]:
+        candidates: list[int] = []
+        if self.membase is not None:
+            candidates.append(self.membase + guest_va)
+        for base in XENIA_LINEAR_BASE_CANDIDATES:
+            candidates.append(base + guest_va)
+        out: list[int] = []
+        for cand in candidates:
+            if cand not in out:
+                out.append(cand)
+        return out
+
+    def _guest_to_readable_host(self, guest_va: int, size: int) -> int | None:
+        for host_addr in self._host_candidates_for_guest(guest_va):
+            if self._is_readable_host_range(host_addr, size):
+                return host_addr
+        return None
+
     def _find_membase(self) -> int | None:
         addr = 0
         max_addr = 0x7FFFFFFFFFFF
@@ -173,7 +211,8 @@ class GuestMemory:
     def read(self, guest_va: int, size: int) -> bytes:
         if self.membase is None:
             raise RuntimeError("not connected")
-        data = self._raw_read(self.membase + guest_va, size)
+        host_addr = self._guest_to_readable_host(guest_va, size)
+        data = self._raw_read(host_addr, size) if host_addr is not None else None
         if data is None:
             raise OSError(f"read failed at guest 0x{guest_va:X}")
         return data
@@ -181,7 +220,9 @@ class GuestMemory:
     def write(self, guest_va: int, data: bytes) -> None:
         if self.membase is None:
             raise RuntimeError("not connected")
-        host_addr = self.membase + guest_va
+        host_addr = self._guest_to_readable_host(guest_va, max(1, len(data)))
+        if host_addr is None:
+            host_addr = self.membase + guest_va
         got = ctypes.c_size_t(0)
         ok = k32.WriteProcessMemory(self.handle, ctypes.c_void_p(host_addr), data, len(data), ctypes.byref(got))
         if ok and got.value == len(data):
@@ -205,6 +246,7 @@ class GuestMemory:
     def iter_guest_regions(self):
         if self.membase is None:
             raise RuntimeError("not connected")
+        yielded: set[tuple[int, int]] = set()
         lo = self.membase
         hi = self.membase + 0x100000000
         addr = lo
@@ -217,11 +259,33 @@ class GuestMemory:
             size = mbi.RegionSize or 0
             readable = mbi.State == MEM_COMMIT and not (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) and mbi.Protect != 0
             if readable and base >= lo:
-                yield base - self.membase, size
+                item = (base - self.membase, size)
+                yielded.add(item)
+                yield item
             nxt = base + size
             if nxt <= addr:
                 break
             addr = nxt
+
+        for linear_base in XENIA_LINEAR_BASE_CANDIDATES:
+            addr = linear_base
+            hi = linear_base + 0x100000000
+            while addr < hi:
+                res = k32.VirtualQueryEx(self.handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
+                if not res:
+                    break
+                base = mbi.BaseAddress or 0
+                size = mbi.RegionSize or 0
+                readable = mbi.State == MEM_COMMIT and not (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) and mbi.Protect != 0
+                if readable and base >= linear_base:
+                    item = (base - linear_base, size)
+                    if item not in yielded:
+                        yielded.add(item)
+                        yield item
+                nxt = base + size
+                if nxt <= addr:
+                    break
+                addr = nxt
 
     def scan(self, needle: bytes, limit: int = 128) -> list[int]:
         hits: list[int] = []
@@ -230,7 +294,8 @@ class GuestMemory:
             off = 0
             while off < size:
                 n = min(chunk, size - off)
-                data = self._raw_read(self.membase + gva + off, n)
+                host_addr = self._guest_to_readable_host(gva + off, n)
+                data = self._raw_read(host_addr, n) if host_addr is not None else None
                 if data:
                     start = 0
                     while True:
@@ -340,6 +405,27 @@ def patch_template(game_type: str, user_code: str, entry_function: str) -> tuple
     return source, target
 
 
+def load_gsc_database(path: Path) -> list[dict]:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    return data.get("Files", [])
+
+
+def default_gsc_db_path_for_target(target_name: str) -> Path:
+    stem = "xbox-gsc-dump-zm.json" if "/gametypes_zm/" in target_name.replace("\\", "/").lower() else "xbox-gsc-dump-mp.json"
+    return app_dir() / stem
+
+
+def find_gsc_database_item(target_name: str) -> dict | None:
+    path = default_gsc_db_path_for_target(target_name)
+    if not path.exists():
+        return None
+    want = target_name.replace("\\", "/").lower()
+    for item in load_gsc_database(path):
+        if item.get("Name", "").replace("\\", "/").lower() == want:
+            return item
+    return None
+
+
 def object_name_from_header(mem: GuestMemory, header_va: int) -> str:
     head = mem.read(header_va, 0x80)
     if head[:4] != GSC_MAGIC:
@@ -364,28 +450,133 @@ def object_size_from_header(mem: GuestMemory, header_va: int) -> int:
     return size
 
 
-def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
-    basename = target_name.rsplit("/", 1)[-1].encode("ascii")
-    headers: set[int] = set()
-    for hit in mem.scan(basename, limit=128):
-        if hit >= 0xF0000000:
-            continue
-        lo = max(0, hit - 0x8000)
-        data = mem.read(lo, hit - lo)
-        idx = data.rfind(GSC_MAGIC)
-        if idx >= 0:
-            headers.add(lo + idx)
+def normalize_gsc_name(name: str) -> str:
+    return name.replace("\\", "/").lower().removesuffix(".gsc")
 
-    matches = sorted(h for h in headers if object_name_from_header(mem, h) == target_name)
+
+def gsc_name_matches(found_name: str, target_name: str) -> bool:
+    found = normalize_gsc_name(found_name)
+    target = normalize_gsc_name(target_name)
+    target_base = target.rsplit("/", 1)[-1]
+    if found == target or found.endswith("/" + target):
+        return True
+    if "/" not in found:
+        return found == target_base
+    return False
+
+
+def iter_gsc_magic_hits(mem: GuestMemory, limit: int = 4096):
+    chunk = 0x100000
+    overlap = len(GSC_MAGIC) - 1
+    seen: set[int] = set()
+    for gva, size in mem.iter_guest_regions():
+        if gva >= 0xF0000000:
+            continue
+        off = 0
+        while off < size:
+            n = min(chunk, size - off)
+            host_addr = mem._guest_to_readable_host(gva + off, n)
+            data = mem._raw_read(host_addr, n) if host_addr is not None else None
+            if data:
+                start = 0
+                while True:
+                    idx = data.find(GSC_MAGIC, start)
+                    if idx < 0:
+                        break
+                    hit = gva + off + idx
+                    if hit not in seen:
+                        seen.add(hit)
+                        yield hit
+                        if len(seen) >= limit:
+                            return
+                    start = idx + 1
+            off += n - (overlap if n == chunk else 0)
+
+
+def is_plausible_gsc_object(mem: GuestMemory, header_va: int) -> bool:
+    try:
+        if mem.read(header_va, 4) != GSC_MAGIC:
+            return False
+        object_size_from_header(mem, header_va)
+        return bool(object_name_from_header(mem, header_va))
+    except (OSError, RuntimeError):
+        return False
+
+
+def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
+    name_needles = {
+        target_name,
+        target_name.replace("/", "\\"),
+        target_name.removesuffix(".gsc"),
+        target_name.replace("/", "\\").removesuffix(".gsc"),
+        target_name.rsplit("/", 1)[-1],
+        target_name.rsplit("/", 1)[-1].removesuffix(".gsc"),
+    }
+    headers: set[int] = set()
+    for needle in sorted(name_needles, key=len, reverse=True):
+        for hit in mem.scan(needle.encode("ascii"), limit=512):
+            if hit >= 0xF0000000:
+                continue
+            lo = max(0, hit - 0x10000)
+            try:
+                data = mem.read(lo, hit - lo)
+            except OSError:
+                continue
+            idx = data.rfind(GSC_MAGIC)
+            if idx >= 0:
+                header = lo + idx
+                if is_plausible_gsc_object(mem, header):
+                    headers.add(header)
+
+    if not headers:
+        for header in iter_gsc_magic_hits(mem):
+            if is_plausible_gsc_object(mem, header):
+                headers.add(header)
+
+    matches = sorted(h for h in headers if gsc_name_matches(object_name_from_header(mem, h), target_name))
     if not matches:
-        seen = [(hex(h), object_name_from_header(mem, h)) for h in sorted(headers)[:16]]
+        seen = [(hex(h), object_name_from_header(mem, h)) for h in sorted(headers)[:32]]
         raise RuntimeError(f"Could not find loaded {target_name}. Found: {seen}")
     obj_va = matches[0]
     return obj_va, object_size_from_header(mem, obj_va)
 
 
 def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
-    obj_va, obj_size = find_live_gsc_object(mem, target_name)
+    try:
+        obj_va, obj_size = find_live_gsc_object(mem, target_name)
+    except RuntimeError as scan_error:
+        if not mem.scan(GSC_MAGIC, limit=1):
+            raise RuntimeError(
+                f"No loaded T6 GSC objects were found in the running Xenia guest memory. "
+                f"{target_name} is probably not mapped yet. With the default/retail XEX, "
+                "load the matching mode or map first, then press Detect/Inject again."
+            ) from scan_error
+        item = find_gsc_database_item(target_name)
+        if item is None:
+            raise
+        pointer_va = int(item["Pointer"])
+        db_size = int(item["Size"])
+        try:
+            obj_va = mem.read_u32(pointer_va)
+            if not (0x80000000 <= obj_va < 0xF0000000):
+                obj_va = int(item["Buffer"])
+            if mem.read(obj_va, 4) != GSC_MAGIC:
+                raise RuntimeError(f"database buffer 0x{obj_va:X} is not a loaded GSC object")
+            obj_size = object_size_from_header(mem, obj_va)
+            if obj_size <= 0:
+                obj_size = db_size
+        except (OSError, RuntimeError) as db_error:
+            raise RuntimeError(f"{scan_error} Database fallback also failed: {db_error}") from db_error
+        return {
+            "entry_va": pointer_va - 8,
+            "name_ptr_va": pointer_va - 8,
+            "size_va": pointer_va - 4,
+            "buffer_va": pointer_va,
+            "name_ptr": 0,
+            "object_va": obj_va,
+            "object_size": obj_size,
+            "source": "database",
+        }
     refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=128) if r < 0x90000000 and (r & 3) == 0]
     candidates: list[dict] = []
     for ref in refs:
@@ -404,6 +595,7 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
                     "name_ptr": name_ptr,
                     "object_va": obj_va,
                     "object_size": obj_size,
+                    "source": "scan",
                 }
             )
     if not candidates:

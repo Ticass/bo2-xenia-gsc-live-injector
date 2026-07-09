@@ -422,12 +422,14 @@ class InjectorWindow(QMainWindow):
             entry = backend.find_live_gsc_entry(mem, target)
             self.signals.log.emit(
                 f"{info}\nFound {target}\n"
-                f"entry=0x{entry['entry_va']:X}, object=0x{entry['object_va']:X}, size=0x{entry['object_size']:X}"
+                f"entry=0x{entry['entry_va']:X}, object=0x{entry['object_va']:X}, "
+                f"size=0x{entry['object_size']:X}, source={entry.get('source', 'scan')}"
             )
             self.signals.info.emit(
                 {
                     "Process": info,
                     "Target": target,
+                    "Mode": entry.get("source", "scan"),
                     "Entry": f"0x{entry['entry_va']:X}",
                     "Object": f"0x{entry['object_va']:X}",
                     "Buffer": f"0x{entry['object_va']:X}",
@@ -509,7 +511,8 @@ class InjectorWindow(QMainWindow):
             self.signals.log.emit(
                 f"{info}\nInjected {target} ({mode})\n"
                 f"entry=0x{live_entry['entry_va']:X}, object=0x{obj:X}, buffer=0x{buffer_va:X}, "
-                f"object_size=0x{size:X}, blob=0x{blob_size:X}, file=0x{len(blob):X}\n"
+                f"object_size=0x{size:X}, blob=0x{blob_size:X}, file=0x{len(blob):X}, "
+                f"source={live_entry.get('source', 'scan')}\n"
                 f"Load/restart the map."
             )
             self.signals.info.emit(
