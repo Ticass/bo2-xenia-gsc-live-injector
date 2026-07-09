@@ -602,6 +602,40 @@ def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
     return obj_va, object_size_from_header(mem, obj_va)
 
 
+def gsc_object_aliases(obj_va: int) -> list[int]:
+    aliases = [obj_va]
+    for delta in (-0x20000000, 0x20000000):
+        alias = obj_va + delta
+        if 0x80000000 <= alias < 0xF0000000 and alias not in aliases:
+            aliases.append(alias)
+    return aliases
+
+
+def find_table_candidates_for_object(mem: GuestMemory, obj_va: int, obj_size: int, source: str) -> list[dict]:
+    refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=128) if r < 0x90000000 and (r & 3) == 0]
+    candidates: list[dict] = []
+    for ref in refs:
+        try:
+            size = mem.read_u32(ref - 4)
+            name_ptr = mem.read_u32(ref - 8)
+        except OSError:
+            continue
+        if size == obj_size and 0x80000000 <= name_ptr < 0xF0000000:
+            candidates.append(
+                {
+                    "entry_va": ref - 8,
+                    "name_ptr_va": ref - 8,
+                    "size_va": ref - 4,
+                    "buffer_va": ref,
+                    "name_ptr": name_ptr,
+                    "object_va": obj_va,
+                    "object_size": obj_size,
+                    "source": source,
+                }
+            )
+    return candidates
+
+
 def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
     try:
         obj_va, obj_size = find_live_gsc_object(mem, target_name)
@@ -638,29 +672,14 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
             "object_size": obj_size,
             "source": "database",
         }
-    refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=128) if r < 0x90000000 and (r & 3) == 0]
     candidates: list[dict] = []
-    for ref in refs:
-        try:
-            size = mem.read_u32(ref - 4)
-            name_ptr = mem.read_u32(ref - 8)
-        except OSError:
-            continue
-        if size == obj_size and 0x80000000 <= name_ptr < 0xF0000000:
-            candidates.append(
-                {
-                    "entry_va": ref - 8,
-                    "name_ptr_va": ref - 8,
-                    "size_va": ref - 4,
-                    "buffer_va": ref,
-                    "name_ptr": name_ptr,
-                    "object_va": obj_va,
-                    "object_size": obj_size,
-                    "source": "scan",
-                }
-            )
+    tried_objects: list[int] = []
+    for alias_va in gsc_object_aliases(obj_va):
+        tried_objects.append(alias_va)
+        candidates.extend(find_table_candidates_for_object(mem, alias_va, obj_size, "scan"))
     if not candidates:
-        raise RuntimeError(f"Found {target_name} object at 0x{obj_va:X}, but no live table entry references it.")
+        tried = ", ".join(f"0x{x:X}" for x in tried_objects)
+        raise RuntimeError(f"Found {target_name} object at 0x{obj_va:X}, but no live table entry references it. Tried aliases: {tried}.")
     candidates.sort(key=lambda c: (0 if 0x83000000 <= c["entry_va"] < 0x85000000 else 1, c["entry_va"]))
     return candidates[0]
 
