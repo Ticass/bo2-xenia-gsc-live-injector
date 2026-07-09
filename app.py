@@ -31,6 +31,7 @@ MEM_COMMIT = 0x1000
 PAGE_GUARD = 0x100
 PAGE_NOACCESS = 0x01
 PAGE_READWRITE = 0x04
+PAGE_EXECUTE_READWRITE = 0x40
 TH32CS_SNAPPROCESS = 0x2
 XENIA_LINEAR_BASE_CANDIDATES = (0x100000000,)
 
@@ -104,6 +105,7 @@ class GuestMemory:
         self.exe_name = ""
         self.handle = None
         self.membase: int | None = None
+        self.linear_bases: set[int] = set(XENIA_LINEAR_BASE_CANDIDATES)
 
     def open(self) -> str:
         matches = [(pid, exe) for pid, exe in list_processes() if "xenia" in exe.lower()]
@@ -161,7 +163,7 @@ class GuestMemory:
         candidates: list[int] = []
         if self.membase is not None:
             candidates.append(self.membase + guest_va)
-        for base in XENIA_LINEAR_BASE_CANDIDATES:
+        for base in sorted(self.linear_bases):
             candidates.append(base + guest_va)
         out: list[int] = []
         for cand in candidates:
@@ -174,6 +176,31 @@ class GuestMemory:
             if self._is_readable_host_range(host_addr, size):
                 return host_addr
         return None
+
+    def _remember_linear_base_from_host(self, host_addr: int) -> None:
+        if host_addr < 0x100000000:
+            return
+        guest_va = host_addr & 0xFFFFFFFF
+        if 0x80000000 <= guest_va < 0xF0000000:
+            self.linear_bases.add(host_addr - guest_va)
+
+    def iter_readable_host_regions(self):
+        addr = 0
+        max_addr = 0x7FFFFFFFFFFF
+        mbi = MEMORY_BASIC_INFORMATION()
+        while addr < max_addr:
+            res = k32.VirtualQueryEx(self.handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
+            if not res:
+                break
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize or 0
+            readable = mbi.State == MEM_COMMIT and not (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) and mbi.Protect != 0
+            if readable and size >= 0x1000:
+                yield base, size
+            nxt = base + size
+            if nxt <= addr:
+                break
+            addr = nxt
 
     def _find_membase(self) -> int | None:
         addr = 0
@@ -220,25 +247,34 @@ class GuestMemory:
     def write(self, guest_va: int, data: bytes) -> None:
         if self.membase is None:
             raise RuntimeError("not connected")
-        host_addr = self._guest_to_readable_host(guest_va, max(1, len(data)))
-        if host_addr is None:
-            host_addr = self.membase + guest_va
-        got = ctypes.c_size_t(0)
-        ok = k32.WriteProcessMemory(self.handle, ctypes.c_void_p(host_addr), data, len(data), ctypes.byref(got))
-        if ok and got.value == len(data):
-            return
-        old = wintypes.DWORD(0)
-        page_start = host_addr & ~0xFFF
-        protect_size = ((host_addr + len(data) + 0xFFF) & ~0xFFF) - page_start
-        changed = k32.VirtualProtectEx(self.handle, ctypes.c_void_p(page_start), protect_size, PAGE_READWRITE, ctypes.byref(old))
-        if changed:
+        tried: list[str] = []
+        for host_addr in self._host_candidates_for_guest(guest_va):
+            if not self._is_readable_host_range(host_addr, max(1, len(data))):
+                tried.append(f"0x{host_addr:X}:unmapped")
+                continue
             got = ctypes.c_size_t(0)
             ok = k32.WriteProcessMemory(self.handle, ctypes.c_void_p(host_addr), data, len(data), ctypes.byref(got))
-            restore_old = wintypes.DWORD(0)
-            k32.VirtualProtectEx(self.handle, ctypes.c_void_p(page_start), protect_size, old.value, ctypes.byref(restore_old))
             if ok and got.value == len(data):
                 return
-        raise OSError(f"write failed at guest 0x{guest_va:X} (err {ctypes.get_last_error()})")
+            first_err = ctypes.get_last_error()
+            old = wintypes.DWORD(0)
+            page_start = host_addr & ~0xFFF
+            protect_size = ((host_addr + len(data) + 0xFFF) & ~0xFFF) - page_start
+            changed = k32.VirtualProtectEx(self.handle, ctypes.c_void_p(page_start), protect_size, PAGE_READWRITE, ctypes.byref(old))
+            if not changed:
+                changed = k32.VirtualProtectEx(self.handle, ctypes.c_void_p(page_start), protect_size, PAGE_EXECUTE_READWRITE, ctypes.byref(old))
+            if changed:
+                got = ctypes.c_size_t(0)
+                ok = k32.WriteProcessMemory(self.handle, ctypes.c_void_p(host_addr), data, len(data), ctypes.byref(got))
+                restore_old = wintypes.DWORD(0)
+                k32.VirtualProtectEx(self.handle, ctypes.c_void_p(page_start), protect_size, old.value, ctypes.byref(restore_old))
+                if ok and got.value == len(data):
+                    return
+                tried.append(f"0x{host_addr:X}:write_err={ctypes.get_last_error()}")
+            else:
+                tried.append(f"0x{host_addr:X}:write_err={first_err},protect_err={ctypes.get_last_error()}")
+        detail = ", ".join(tried) if tried else "no host candidates"
+        raise OSError(f"write failed at guest 0x{guest_va:X} ({detail})")
 
     def read_u32(self, guest_va: int) -> int:
         return struct.unpack(">I", self.read(guest_va, 4))[0]
@@ -267,7 +303,7 @@ class GuestMemory:
                 break
             addr = nxt
 
-        for linear_base in XENIA_LINEAR_BASE_CANDIDATES:
+        for linear_base in sorted(self.linear_bases):
             addr = linear_base
             hi = linear_base + 0x100000000
             while addr < hi:
@@ -305,6 +341,31 @@ class GuestMemory:
                         hits.append(gva + off + i)
                         if len(hits) >= limit:
                             return hits
+                        start = i + 1
+                off += n - (len(needle) - 1 if n == chunk else 0)
+        if hits:
+            return hits
+
+        for host_base, size in self.iter_readable_host_regions():
+            if size > 0x10000000:
+                continue
+            off = 0
+            while off < size:
+                n = min(chunk, size - off)
+                data = self._raw_read(host_base + off, n)
+                if data:
+                    start = 0
+                    while True:
+                        i = data.find(needle, start)
+                        if i < 0:
+                            break
+                        host_hit = host_base + off + i
+                        self._remember_linear_base_from_host(host_hit)
+                        guest_hit = host_hit & 0xFFFFFFFF
+                        if 0x80000000 <= guest_hit < 0xF0000000:
+                            hits.append(guest_hit)
+                            if len(hits) >= limit:
+                                return hits
                         start = i + 1
                 off += n - (len(needle) - 1 if n == chunk else 0)
         return hits
