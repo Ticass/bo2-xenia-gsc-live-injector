@@ -82,6 +82,32 @@ def user_dir() -> Path:
     return path
 
 
+def address_cache_path() -> Path:
+    return user_dir() / "address_cache.json"
+
+
+def load_address_cache() -> dict:
+    path = address_cache_path()
+    if not path.exists():
+        return {"version": 1, "entries": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"version": 1, "entries": {}}
+        data.setdefault("version", 1)
+        data.setdefault("entries", {})
+        return data
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "entries": {}}
+
+
+def save_address_cache(data: dict) -> None:
+    path = address_cache_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def list_processes() -> list[tuple[int, str]]:
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snap == -1:
@@ -131,6 +157,12 @@ class GuestMemory:
             detail = "; ".join(errors) if errors else "no readable Xenia processes"
             raise RuntimeError(f"Xenia found, but CoD/guest memory is not mapped yet. Checked: {detail}")
         return f"{self.exe_name} pid={self.pid}, guest membase=0x{self.membase:X}"
+
+    def cache_key(self, target_name: str) -> str:
+        exe = self.exe_name.lower() if self.exe_name else "unknown"
+        base = f"0x{self.membase:X}" if self.membase is not None else "unknown"
+        target = target_name.replace("\\", "/").lower()
+        return f"{exe}|{base}|{target}"
 
     def _raw_read(self, host_addr: int, size: int) -> bytes | None:
         buf = ctypes.create_string_buffer(size)
@@ -636,7 +668,76 @@ def find_table_candidates_for_object(mem: GuestMemory, obj_va: int, obj_size: in
     return candidates
 
 
+def validate_cached_gsc_entry(mem: GuestMemory, target_name: str, cached: dict) -> dict | None:
+    try:
+        linear_bases = cached.get("linear_bases", [])
+        if isinstance(linear_bases, list):
+            for base in linear_bases:
+                mem.linear_bases.add(int(str(base), 16))
+        obj_va = int(str(cached["object_va"]), 16)
+        obj_size = int(str(cached["object_size"]), 16)
+        entry_va = int(str(cached["entry_va"]), 16)
+        size_va = int(str(cached["size_va"]), 16)
+        buffer_va = int(str(cached["buffer_va"]), 16)
+        name_ptr_va = int(str(cached.get("name_ptr_va", entry_va)), 16)
+        if mem.read(obj_va, 4) != GSC_MAGIC:
+            return None
+        if object_size_from_header(mem, obj_va) != obj_size:
+            return None
+        if not gsc_name_matches(object_name_from_header(mem, obj_va), target_name):
+            return None
+        if mem.read_u32(size_va) != obj_size:
+            return None
+        if mem.read_u32(buffer_va) != obj_va:
+            return None
+        name_ptr = mem.read_u32(name_ptr_va)
+        return {
+            "entry_va": entry_va,
+            "name_ptr_va": name_ptr_va,
+            "size_va": size_va,
+            "buffer_va": buffer_va,
+            "name_ptr": name_ptr,
+            "object_va": obj_va,
+            "object_size": obj_size,
+            "source": "cache",
+        }
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+        return None
+
+
+def get_cached_gsc_entry(mem: GuestMemory, target_name: str) -> dict | None:
+    cache = load_address_cache()
+    cached = cache.get("entries", {}).get(mem.cache_key(target_name))
+    if not isinstance(cached, dict):
+        return None
+    return validate_cached_gsc_entry(mem, target_name, cached)
+
+
+def remember_gsc_entry(mem: GuestMemory, target_name: str, entry: dict) -> None:
+    if entry.get("source") == "cache":
+        return
+    cache = load_address_cache()
+    entries = cache.setdefault("entries", {})
+    entries[mem.cache_key(target_name)] = {
+        "target_gsc": target_name,
+        "exe_name": mem.exe_name,
+        "membase": f"0x{mem.membase:X}" if mem.membase is not None else None,
+        "linear_bases": [f"0x{x:X}" for x in sorted(mem.linear_bases)],
+        "entry_va": f"0x{entry['entry_va']:X}",
+        "name_ptr_va": f"0x{entry['name_ptr_va']:X}",
+        "size_va": f"0x{entry['size_va']:X}",
+        "buffer_va": f"0x{entry['buffer_va']:X}",
+        "object_va": f"0x{entry['object_va']:X}",
+        "object_size": f"0x{entry['object_size']:X}",
+    }
+    save_address_cache(cache)
+
+
 def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
+    cached = get_cached_gsc_entry(mem, target_name)
+    if cached is not None:
+        return cached
+
     try:
         obj_va, obj_size = find_live_gsc_object(mem, target_name)
     except RuntimeError as scan_error:
@@ -662,7 +763,7 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
                 obj_size = db_size
         except (OSError, RuntimeError) as db_error:
             raise RuntimeError(f"{scan_error} Database fallback also failed: {db_error}") from db_error
-        return {
+        entry = {
             "entry_va": pointer_va - 8,
             "name_ptr_va": pointer_va - 8,
             "size_va": pointer_va - 4,
@@ -672,6 +773,8 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
             "object_size": obj_size,
             "source": "database",
         }
+        remember_gsc_entry(mem, target_name, entry)
+        return entry
     candidates: list[dict] = []
     tried_objects: list[int] = []
     for alias_va in gsc_object_aliases(obj_va):
@@ -681,7 +784,9 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
         tried = ", ".join(f"0x{x:X}" for x in tried_objects)
         raise RuntimeError(f"Found {target_name} object at 0x{obj_va:X}, but no live table entry references it. Tried aliases: {tried}.")
     candidates.sort(key=lambda c: (0 if 0x83000000 <= c["entry_va"] < 0x85000000 else 1, c["entry_va"]))
-    return candidates[0]
+    entry = candidates[0]
+    remember_gsc_entry(mem, target_name, entry)
+    return entry
 
 
 DEFAULT_CODE = """codex_main()
