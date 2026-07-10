@@ -433,7 +433,7 @@ class InjectorWindow(QMainWindow):
         try:
             info = mem.open()
             target = self.current_target()
-            entry = backend.find_live_gsc_entry(mem, target)
+            entry = backend.find_quick_gsc_entry(mem, target)
             self.signals.log.emit(
                 f"{info}\nFound {target}\n"
                 f"entry=0x{entry['entry_va']:X}, object=0x{entry['object_va']:X}, "

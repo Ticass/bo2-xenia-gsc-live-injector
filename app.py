@@ -1023,6 +1023,20 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
     return entry
 
 
+def find_quick_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
+    cached = get_cached_gsc_entry(mem, target_name)
+    if cached is not None:
+        return cached
+    database_entry = database_gsc_entry(mem, target_name)
+    if database_entry is not None:
+        remember_gsc_entry(mem, target_name, database_entry)
+        return database_entry
+    raise RuntimeError(
+        f"Fast detect could not validate {target_name}. The script may not be mapped yet, "
+        "or this build needs the deeper scan used by Compile + Inject."
+    )
+
+
 DEFAULT_CODE = """codex_main()
 {
     level thread codex_on_connect();
