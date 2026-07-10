@@ -494,6 +494,12 @@ class InjectorWindow(QMainWindow):
                 }
                 buffer_va = obj
             else:
+                if target.replace("\\", "/").lower().endswith("/_objpoints.gsc"):
+                    raise RuntimeError(
+                        f"Compiled _objpoints.gsc is larger than the live object "
+                        f"(0x{blob_size:X} > 0x{size:X}). Relocating _objpoints is unsafe on system-link "
+                        "map load; use MP _globallogic.gsc instead."
+                    )
                 if blob_size > backend.MAX_RELOCATED_BLOB_SIZE:
                     raise RuntimeError(
                         f"Compiled blob is too large for the relocation buffer: "

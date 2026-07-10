@@ -545,6 +545,7 @@ SCRIPT_TARGETS = {
     ("ZM", "_callbacksetup.gsc"): "maps/mp/gametypes_zm/_callbacksetup.gsc",
     ("MP", "_callbacksetup.gsc"): "maps/mp/gametypes/_callbacksetup.gsc",
     ("MP", "_objpoints.gsc"): "maps/mp/gametypes/_objpoints.gsc",
+    ("MP", "_globallogic.gsc"): "maps/mp/gametypes/_globallogic.gsc",
 }
 
 
@@ -623,11 +624,34 @@ def patch_objpoints_template(user_code: str, entry_function: str) -> tuple[Path,
     return source, target
 
 
+def patch_globallogic_template(user_code: str, entry_function: str) -> tuple[Path, str]:
+    target = target_for_script("MP", "_globallogic.gsc")
+    template = app_dir() / "templates" / "mp" / "_globallogic.gsc"
+    text = template.read_text(encoding="utf-8", errors="replace")
+    marker = "    // CODEX_GLOBALLOGIC_LAUNCHER"
+    launcher = (
+        "    if ( !isdefined( level.codex_injector_started ) )\n"
+        "    {\n"
+        "        level.codex_injector_started = 1;\n"
+        f"        level thread {entry_function}();\n"
+        "    }"
+    )
+    if marker not in text:
+        raise RuntimeError("Globallogic template patch point not found.")
+    out_dir = user_dir() / "build"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    source = out_dir / "_globallogic_mp_patched.gsc"
+    source.write_text(text.replace(marker, launcher).rstrip() + "\n\n" + user_code.rstrip() + "\n", encoding="utf-8", newline="\n")
+    return source, target
+
+
 def patch_template_for_target(game_type: str, script_name: str, user_code: str, entry_function: str) -> tuple[Path, str]:
     if script_name == "_callbacksetup.gsc":
         return patch_callbacksetup_template(game_type, user_code, entry_function)
     if game_type.upper() == "MP" and script_name == "_objpoints.gsc":
         return patch_objpoints_template(user_code, entry_function)
+    if game_type.upper() == "MP" and script_name == "_globallogic.gsc":
+        return patch_globallogic_template(user_code, entry_function)
     raise RuntimeError(f"Unsupported target: {game_type} {script_name}")
 
 
