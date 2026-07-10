@@ -22,6 +22,8 @@ PE_SIG = bytes.fromhex("50450000")
 GSC_OBJ_NAME_FIELD_OFFSET = 0x30
 GSC_OBJ_SIZE_FIELD_OFFSET = 0x24
 GSC_MAGIC = b"\x80GSC"
+MAX_RELOCATED_BLOB_SIZE = 0x200000
+PREFERRED_RELOCATION_BUFFERS = (0x40300000,)
 
 PROCESS_VM_READ = 0x0010
 PROCESS_VM_WRITE = 0x0020
@@ -163,6 +165,11 @@ class GuestMemory:
         base = f"0x{self.membase:X}" if self.membase is not None else "unknown"
         target = target_name.replace("\\", "/").lower()
         return f"{exe}|{base}|{target}"
+
+    def stable_cache_key(self, target_name: str) -> str:
+        exe = self.exe_name.lower() if self.exe_name else "unknown"
+        target = target_name.replace("\\", "/").lower()
+        return f"{exe}|{target}"
 
     def _raw_read(self, host_addr: int, size: int) -> bytes | None:
         buf = ctypes.create_string_buffer(size)
@@ -439,6 +446,61 @@ def object_size_from_blob(bytecode: bytes) -> int:
     return len(bytecode)
 
 
+def find_zero_run(data: bytes, needed: int) -> int:
+    start = 0
+    marker = b"\x00" * min(needed, 64)
+    while True:
+        idx = data.find(marker, start)
+        if idx < 0:
+            return -1
+        end = idx
+        while end < len(data) and data[end] == 0:
+            end += 1
+        if end - idx >= needed:
+            return idx
+        start = end + 1
+
+
+def is_writable_guest_buffer(mem: GuestMemory, guest_va: int, size: int) -> bool:
+    try:
+        probe_size = min(max(size, 1), 16)
+        old = mem.read(guest_va, probe_size)
+        mem.write(guest_va, old)
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def find_relocation_buffer(mem: GuestMemory, size: int) -> int:
+    if size > MAX_RELOCATED_BLOB_SIZE:
+        raise RuntimeError(f"Compiled blob is too large for relocation: 0x{size:X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}")
+    aligned_size = (size + 0xF) & ~0xF
+    for candidate in PREFERRED_RELOCATION_BUFFERS:
+        if is_writable_guest_buffer(mem, candidate, aligned_size):
+            return candidate
+    chunk_size = 0x100000
+    for gva, region_size in mem.iter_guest_regions():
+        if gva >= 0xF0000000 or region_size < aligned_size:
+            continue
+        if 0x82000000 <= gva < 0x84000000:
+            continue
+        off = 0
+        while off < region_size:
+            n = min(chunk_size, region_size - off)
+            try:
+                data = mem.read(gva + off, n)
+            except OSError:
+                off += n
+                continue
+            idx = find_zero_run(data, aligned_size)
+            if idx >= 0:
+                candidate = (gva + off + idx + 0xF) & ~0xF
+                if candidate + aligned_size <= gva + off + n and is_writable_guest_buffer(mem, candidate, aligned_size):
+                    return candidate
+            off += n
+    raise RuntimeError("Could not find a mapped writable guest buffer for relocated GSC injection.")
+
+
 def run_gsc_tool_compile(source: Path, output_name: str) -> bytes:
     tool = app_dir() / "tools" / "gsc-tool" / "gsc-tool.exe"
     if not tool.exists():
@@ -680,9 +742,20 @@ def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
             if is_plausible_gsc_object(mem, header):
                 headers.add(header)
 
-    matches = sorted(h for h in headers if gsc_name_matches(object_name_from_header(mem, h), target_name))
+    matches = []
+    for header in sorted(headers):
+        try:
+            if gsc_name_matches(object_name_from_header(mem, header), target_name):
+                matches.append(header)
+        except OSError:
+            continue
     if not matches:
-        seen = [(hex(h), object_name_from_header(mem, h)) for h in sorted(headers)[:32]]
+        seen = []
+        for h in sorted(headers)[:32]:
+            try:
+                seen.append((hex(h), object_name_from_header(mem, h)))
+            except OSError:
+                seen.append((hex(h), "<unreadable>"))
         raise RuntimeError(f"Could not find loaded {target_name}. Found: {seen}")
     obj_va = matches[0]
     return obj_va, object_size_from_header(mem, obj_va)
@@ -766,10 +839,26 @@ def validate_cached_gsc_entry(mem: GuestMemory, target_name: str, cached: dict) 
 
 def get_cached_gsc_entry(mem: GuestMemory, target_name: str) -> dict | None:
     cache = load_address_cache()
-    cached = cache.get("entries", {}).get(mem.cache_key(target_name))
-    if not isinstance(cached, dict):
-        return None
-    return validate_cached_gsc_entry(mem, target_name, cached)
+    entries = cache.get("entries", {})
+    for key in (mem.cache_key(target_name), mem.stable_cache_key(target_name)):
+        cached = entries.get(key)
+        if isinstance(cached, dict):
+            entry = validate_cached_gsc_entry(mem, target_name, cached)
+            if entry is not None:
+                return entry
+    want = target_name.replace("\\", "/").lower()
+    exe = mem.exe_name.lower() if mem.exe_name else ""
+    for cached in entries.values():
+        if not isinstance(cached, dict):
+            continue
+        if cached.get("target_gsc", "").replace("\\", "/").lower() != want:
+            continue
+        if exe and cached.get("exe_name", "").lower() not in ("", exe):
+            continue
+        entry = validate_cached_gsc_entry(mem, target_name, cached)
+        if entry is not None:
+            return entry
+    return None
 
 
 def remember_gsc_entry(mem: GuestMemory, target_name: str, entry: dict) -> None:
@@ -777,7 +866,7 @@ def remember_gsc_entry(mem: GuestMemory, target_name: str, entry: dict) -> None:
         return
     cache = load_address_cache()
     entries = cache.setdefault("entries", {})
-    entries[mem.cache_key(target_name)] = {
+    cached = {
         "target_gsc": target_name,
         "exe_name": mem.exe_name,
         "membase": f"0x{mem.membase:X}" if mem.membase is not None else None,
@@ -789,13 +878,54 @@ def remember_gsc_entry(mem: GuestMemory, target_name: str, entry: dict) -> None:
         "object_va": f"0x{entry['object_va']:X}",
         "object_size": f"0x{entry['object_size']:X}",
     }
+    entries[mem.cache_key(target_name)] = cached
+    entries[mem.stable_cache_key(target_name)] = cached
     save_address_cache(cache)
+
+
+def database_gsc_entry(mem: GuestMemory, target_name: str) -> dict | None:
+    item = find_gsc_database_item(target_name)
+    if item is None:
+        return None
+    pointer_va = int(item["Pointer"])
+    try:
+        obj_va = mem.read_u32(pointer_va)
+        if not (0x80000000 <= obj_va < 0xF0000000):
+            return None
+        if mem.read(obj_va, 4) != GSC_MAGIC:
+            return None
+        obj_size = object_size_from_header(mem, obj_va)
+        if not gsc_name_matches(object_name_from_header(mem, obj_va), target_name):
+            return None
+        size_va = pointer_va - 4
+        table_size = mem.read_u32(size_va)
+        if table_size != obj_size:
+            return None
+        name_ptr_va = pointer_va - 8
+        name_ptr = mem.read_u32(name_ptr_va)
+        return {
+            "entry_va": pointer_va - 8,
+            "name_ptr_va": name_ptr_va,
+            "size_va": size_va,
+            "buffer_va": pointer_va,
+            "name_ptr": name_ptr,
+            "object_va": obj_va,
+            "object_size": obj_size,
+            "source": "database",
+        }
+    except (OSError, RuntimeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
     cached = get_cached_gsc_entry(mem, target_name)
     if cached is not None:
         return cached
+
+    database_entry = database_gsc_entry(mem, target_name)
+    if database_entry is not None:
+        remember_gsc_entry(mem, target_name, database_entry)
+        return database_entry
 
     try:
         obj_va, obj_size = find_live_gsc_object(mem, target_name)

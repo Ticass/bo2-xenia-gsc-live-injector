@@ -43,10 +43,6 @@ TEXT = "#dce2ea"
 MUTED = "#8b949e"
 GREEN = "#52d273"
 RED = "#ff5a5f"
-FREE_GSC_BUFFER = 0x40300000
-MAX_RELOCATED_BLOB_SIZE = 0x200000
-
-
 class WorkerSignals(QObject):
     log = Signal(str)
     error = Signal(str)
@@ -498,12 +494,12 @@ class InjectorWindow(QMainWindow):
                 }
                 buffer_va = obj
             else:
-                if blob_size > MAX_RELOCATED_BLOB_SIZE:
+                if blob_size > backend.MAX_RELOCATED_BLOB_SIZE:
                     raise RuntimeError(
                         f"Compiled blob is too large for the relocation buffer: "
-                        f"0x{blob_size:X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}"
+                        f"0x{blob_size:X} > 0x{backend.MAX_RELOCATED_BLOB_SIZE:X}"
                     )
-                buffer_va = FREE_GSC_BUFFER
+                buffer_va = backend.find_relocation_buffer(mem, len(blob))
                 mem.write(buffer_va, b"\x00" * len(blob))
                 mem.write(buffer_va, blob)
                 mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
