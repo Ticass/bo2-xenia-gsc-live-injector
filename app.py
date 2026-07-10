@@ -445,7 +445,7 @@ def run_gsc_tool_compile(source: Path, output_name: str) -> bytes:
         raise FileNotFoundError(f"Missing gsc-tool: {tool}")
     with tempfile.TemporaryDirectory(prefix="bo2_gsc_") as tmp:
         tmp_path = Path(tmp)
-        src = tmp_path / "_callbacksetup.gsc"
+        src = tmp_path / output_name.replace("\\", "/").rsplit("/", 1)[-1]
         shutil.copyfile(source, src)
         cmd = [str(tool), "-m", "comp", "-g", "t6", "-s", "xb2", "-i", "server", str(src)]
         startup = subprocess.STARTUPINFO()
@@ -458,9 +458,30 @@ def run_gsc_tool_compile(source: Path, output_name: str) -> bytes:
         return ensure_gsc_object_name(produced.read_bytes(), output_name)
 
 
-def patch_template(game_type: str, user_code: str, entry_function: str) -> tuple[Path, str]:
+SCRIPT_TARGETS = {
+    ("ZM", "_callbacksetup.gsc"): "maps/mp/gametypes_zm/_callbacksetup.gsc",
+    ("MP", "_callbacksetup.gsc"): "maps/mp/gametypes/_callbacksetup.gsc",
+    ("MP", "_objpoints.gsc"): "maps/mp/gametypes/_objpoints.gsc",
+}
+
+
+def script_choices_for_game_type(game_type: str) -> list[str]:
+    gt = game_type.upper()
+    return [script for (mode, script), _target in SCRIPT_TARGETS.items() if mode == gt]
+
+
+def target_for_script(game_type: str, script_name: str | None = None) -> str:
+    gt = game_type.upper()
+    script = script_name or "_callbacksetup.gsc"
+    try:
+        return SCRIPT_TARGETS[(gt, script)]
+    except KeyError as exc:
+        raise RuntimeError(f"Unsupported target: {gt} {script}") from exc
+
+
+def patch_callbacksetup_template(game_type: str, user_code: str, entry_function: str) -> tuple[Path, str]:
     gt = game_type.lower()
-    target = "maps/mp/gametypes_zm/_callbacksetup.gsc" if gt == "zm" else "maps/mp/gametypes/_callbacksetup.gsc"
+    target = target_for_script(game_type, "_callbacksetup.gsc")
     template = app_dir() / "templates" / gt / "_callbacksetup.gsc"
     text = template.read_text(encoding="utf-8", errors="replace")
     old = (
@@ -496,6 +517,39 @@ def patch_template(game_type: str, user_code: str, entry_function: str) -> tuple
     source = out_dir / f"_callbacksetup_{gt}_patched.gsc"
     source.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
     return source, target
+
+
+def patch_objpoints_template(user_code: str, entry_function: str) -> tuple[Path, str]:
+    target = target_for_script("MP", "_objpoints.gsc")
+    template = app_dir() / "templates" / "mp" / "_objpoints.gsc"
+    text = template.read_text(encoding="utf-8", errors="replace")
+    marker = "    // CODEX_OBJPOINTS_LAUNCHER"
+    launcher = (
+        "    if ( !isdefined( level.codex_injector_started ) )\n"
+        "    {\n"
+        "        level.codex_injector_started = 1;\n"
+        f"        level thread {entry_function}();\n"
+        "    }"
+    )
+    if marker not in text:
+        raise RuntimeError("Objpoints template patch point not found.")
+    out_dir = user_dir() / "build"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    source = out_dir / "_objpoints_mp_patched.gsc"
+    source.write_text(text.replace(marker, launcher).rstrip() + "\n\n" + user_code.rstrip() + "\n", encoding="utf-8", newline="\n")
+    return source, target
+
+
+def patch_template_for_target(game_type: str, script_name: str, user_code: str, entry_function: str) -> tuple[Path, str]:
+    if script_name == "_callbacksetup.gsc":
+        return patch_callbacksetup_template(game_type, user_code, entry_function)
+    if game_type.upper() == "MP" and script_name == "_objpoints.gsc":
+        return patch_objpoints_template(user_code, entry_function)
+    raise RuntimeError(f"Unsupported target: {game_type} {script_name}")
+
+
+def patch_template(game_type: str, user_code: str, entry_function: str) -> tuple[Path, str]:
+    return patch_callbacksetup_template(game_type, user_code, entry_function)
 
 
 def load_gsc_database(path: Path) -> list[dict]:

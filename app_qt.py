@@ -293,6 +293,11 @@ class InjectorWindow(QMainWindow):
         self.game_type = QComboBox()
         self.game_type.addItems(["ZM", "MP"])
         layout.addWidget(self.game_type)
+        layout.addWidget(QLabel("SCRIPT FILE"))
+        self.script_file = QComboBox()
+        layout.addWidget(self.script_file)
+        self.game_type.currentTextChanged.connect(self.refresh_script_choices)
+        self.refresh_script_choices()
         layout.addWidget(QLabel("ENTRY FUNCTION"))
         self.entry_function = QLineEdit("codex_main")
         layout.addWidget(self.entry_function)
@@ -312,6 +317,19 @@ class InjectorWindow(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         return box
+
+    def refresh_script_choices(self) -> None:
+        current = self.script_file.currentText() if hasattr(self, "script_file") else ""
+        choices = backend.script_choices_for_game_type(self.game_type.currentText())
+        self.script_file.blockSignals(True)
+        self.script_file.clear()
+        self.script_file.addItems(choices)
+        if current in choices:
+            self.script_file.setCurrentText(current)
+        self.script_file.blockSignals(False)
+
+    def current_target(self) -> str:
+        return backend.target_for_script(self.game_type.currentText(), self.script_file.currentText())
 
     def _build_editor_panel(self) -> QWidget:
         box = QFrame()
@@ -418,7 +436,7 @@ class InjectorWindow(QMainWindow):
         mem = backend.GuestMemory()
         try:
             info = mem.open()
-            target = "maps/mp/gametypes_zm/_callbacksetup.gsc" if self.game_type.currentText() == "ZM" else "maps/mp/gametypes/_callbacksetup.gsc"
+            target = self.current_target()
             entry = backend.find_live_gsc_entry(mem, target)
             self.signals.log.emit(
                 f"{info}\nFound {target}\n"
@@ -447,12 +465,14 @@ class InjectorWindow(QMainWindow):
         if not code:
             raise RuntimeError("Editor is empty.")
         target_mode = self.game_type.currentText()
+        script_name = self.script_file.currentText()
         entry = self.entry_function.text().strip() or "codex_main"
-        source, target = backend.patch_template(target_mode, code, entry)
+        source, target = backend.patch_template_for_target(target_mode, script_name, code, entry)
         self.signals.log.emit(f"Compiling {target}...")
         blob = backend.run_gsc_tool_compile(source, target)
         blob_size = backend.object_size_from_blob(blob)
-        compiled_path = backend.user_dir() / "build" / f"{target_mode.lower()}_callbacksetup_injected.gsc"
+        compiled_stem = script_name.removesuffix(".gsc").lstrip("_")
+        compiled_path = backend.user_dir() / "build" / f"{target_mode.lower()}_{compiled_stem}_injected.gsc"
         compiled_path.write_bytes(blob)
         mem = backend.GuestMemory()
         try:
