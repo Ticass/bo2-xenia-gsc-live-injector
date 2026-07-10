@@ -341,7 +341,7 @@ class InjectorWindow(QMainWindow):
         for name, snippet in backend.GSC_SNIPPETS.items():
             btn = QToolButton()
             btn.setText(name)
-            btn.clicked.connect(lambda _checked=False, s=snippet: self.editor.insertPlainText("\n" + s))
+            btn.clicked.connect(lambda _checked=False, s=snippet: self.editor.setPlainText(s))
             bar.addWidget(btn)
         layout.addLayout(bar)
         self.editor = GscCodeEditor()
@@ -499,12 +499,17 @@ class InjectorWindow(QMainWindow):
                 backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
                 backup_path.write_bytes(backup)
                 mem.write(obj, blob + (b"\x00" * (size - len(blob))))
+                mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
                 mode = "in-place"
                 cfg = {
                     "mode": "inplace",
                     "target_gsc": target,
+                    "entry_va": f"0x{live_entry['entry_va']:X}",
+                    "size_va": f"0x{live_entry['size_va']:X}",
                     "object_va": f"0x{obj:X}",
                     "object_size": f"0x{size:X}",
+                    "old_size": f"0x{size:X}",
+                    "new_size": f"0x{blob_size:X}",
                     "backup_file": str(backup_path),
                     "compiled_file": str(compiled_path),
                     "script_len": f"0x{blob_size:X}",
@@ -617,7 +622,7 @@ class InjectorWindow(QMainWindow):
             else:
                 backup = Path(cfg["backup_file"]).read_bytes()
                 mem.write(int(cfg["object_va"], 16), backup)
-                if cfg.get("mode") == "expanded-inplace" and cfg.get("size_va") and cfg.get("old_size"):
+                if cfg.get("size_va") and cfg.get("old_size"):
                     mem.write(int(cfg["size_va"], 16), int(cfg["old_size"], 16).to_bytes(4, "big"))
                 self.signals.log.emit(f"{info}\nRestored {cfg['target_gsc']} at {cfg['object_va']}.")
         finally:

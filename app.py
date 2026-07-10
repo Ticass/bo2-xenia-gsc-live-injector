@@ -1245,12 +1245,28 @@ def run_freeze_probe(target_name: str, duration_seconds: int = 120, interval_sec
     report_dir = user_dir() / "freeze_reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    json_path = report_dir / f"freeze_probe_{stamp}.json"
+    txt_path = report_dir / f"freeze_probe_{stamp}.txt"
     mem = GuestMemory()
     samples: list[dict] = []
     entry: dict | None = None
     entry_error = ""
     logs = find_recent_xenia_logs()
     initial_log_sizes = {str(p): p.stat().st_size for p in logs if p.exists()}
+    process_info = ""
+    json_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "target": target_name,
+                "status": "running",
+                "samples": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     try:
         process_info = mem.open()
         try:
@@ -1266,6 +1282,22 @@ def run_freeze_probe(target_name: str, duration_seconds: int = 120, interval_sec
                 "gsc": read_gsc_entry_snapshot(mem, target_name, entry),
             }
             samples.append(sample)
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "target": target_name,
+                        "status": "running",
+                        "process": process_info,
+                        "entry": entry,
+                        "entry_error": entry_error,
+                        "samples": samples,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             time.sleep(interval_seconds)
     finally:
         mem.close()
@@ -1293,7 +1325,7 @@ def run_freeze_probe(target_name: str, duration_seconds: int = 120, interval_sec
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "target": target_name,
         "duration_seconds": duration_seconds,
-        "process": process_info if "process_info" in locals() else "",
+        "process": process_info,
         "entry": entry,
         "entry_error": entry_error,
         "last_injection": json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else None,
@@ -1303,8 +1335,6 @@ def run_freeze_probe(target_name: str, duration_seconds: int = 120, interval_sec
         "findings": analyze_probe(samples, combined_log),
         "log_tail": log_chunks,
     }
-    json_path = report_dir / f"freeze_probe_{stamp}.json"
-    txt_path = report_dir / f"freeze_probe_{stamp}.txt"
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     lines = [
         "BO2 Xenia GSC Freeze Probe",
@@ -1499,13 +1529,37 @@ GSC_BUILTINS = {
 }
 
 GSC_SNIPPETS = {
-    "loop_spawn_message": (
+    "tiny_hello_loop": (
         "codex_main()\n"
         "{\n"
         "    for (;;)\n"
         "    {\n"
         "        wait 3;\n"
         "        iprintlnbold( \"Hello from GSC\" );\n"
+        "    }\n"
+        "}\n"
+    ),
+    "loop_spawn_message": (
+        "codex_main()\n"
+        "{\n"
+        "    level thread codex_on_connect();\n"
+        "}\n\n"
+        "codex_on_connect()\n"
+        "{\n"
+        "    for (;;)\n"
+        "    {\n"
+        "        level waittill( \"connecting\", player );\n"
+        "        player thread codex_on_spawn();\n"
+        "    }\n"
+        "}\n\n"
+        "codex_on_spawn()\n"
+        "{\n"
+        "    self endon( \"disconnect\" );\n\n"
+        "    for (;;)\n"
+        "    {\n"
+        "        self waittill( \"spawned_player\" );\n"
+        "        wait 3;\n"
+        "        self iprintlnbold( \"Hello from GSC\" );\n"
         "    }\n"
         "}\n"
     ),
