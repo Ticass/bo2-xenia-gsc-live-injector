@@ -499,7 +499,7 @@ class InjectorWindow(QMainWindow):
                         f"Compiled blob is too large for the relocation buffer: "
                         f"0x{blob_size:X} > 0x{backend.MAX_RELOCATED_BLOB_SIZE:X}"
                     )
-                buffer_va = backend.find_relocation_buffer(mem, len(blob))
+                buffer_va = backend.find_relocation_buffer(mem, len(blob), obj)
                 mem.write(buffer_va, b"\x00" * len(blob))
                 mem.write(buffer_va, blob)
                 mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))

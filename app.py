@@ -23,7 +23,6 @@ GSC_OBJ_NAME_FIELD_OFFSET = 0x30
 GSC_OBJ_SIZE_FIELD_OFFSET = 0x24
 GSC_MAGIC = b"\x80GSC"
 MAX_RELOCATED_BLOB_SIZE = 0x200000
-PREFERRED_RELOCATION_BUFFERS = (0x40300000,)
 
 PROCESS_VM_READ = 0x0010
 PROCESS_VM_WRITE = 0x0020
@@ -471,20 +470,18 @@ def is_writable_guest_buffer(mem: GuestMemory, guest_va: int, size: int) -> bool
         return False
 
 
-def find_relocation_buffer(mem: GuestMemory, size: int) -> int:
-    if size > MAX_RELOCATED_BLOB_SIZE:
-        raise RuntimeError(f"Compiled blob is too large for relocation: 0x{size:X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}")
-    aligned_size = (size + 0xF) & ~0xF
-    for candidate in PREFERRED_RELOCATION_BUFFERS:
-        if is_writable_guest_buffer(mem, candidate, aligned_size):
-            return candidate
+def find_zero_buffer_in_region(mem: GuestMemory, gva: int, region_size: int, aligned_size: int, start_va: int | None = None) -> int | None:
     chunk_size = 0x100000
-    for gva, region_size in mem.iter_guest_regions():
-        if gva >= 0xF0000000 or region_size < aligned_size:
+    if start_va is not None and gva <= start_va < gva + region_size:
+        offsets = [max(0, start_va - gva), 0]
+    else:
+        offsets = [0]
+    seen_offsets: set[int] = set()
+    for initial_off in offsets:
+        if initial_off in seen_offsets:
             continue
-        if 0x82000000 <= gva < 0x84000000:
-            continue
-        off = 0
+        seen_offsets.add(initial_off)
+        off = initial_off
         while off < region_size:
             n = min(chunk_size, region_size - off)
             try:
@@ -498,6 +495,30 @@ def find_relocation_buffer(mem: GuestMemory, size: int) -> int:
                 if candidate + aligned_size <= gva + off + n and is_writable_guest_buffer(mem, candidate, aligned_size):
                     return candidate
             off += n
+    return None
+
+
+def find_relocation_buffer(mem: GuestMemory, size: int, near_va: int | None = None) -> int:
+    if size > MAX_RELOCATED_BLOB_SIZE:
+        raise RuntimeError(f"Compiled blob is too large for relocation: 0x{size:X} > 0x{MAX_RELOCATED_BLOB_SIZE:X}")
+    aligned_size = (size + 0xF) & ~0xF
+
+    regions = list(mem.iter_guest_regions())
+    if near_va is not None:
+        for gva, region_size in regions:
+            if gva <= near_va < gva + region_size and 0x80000000 <= gva < 0xF0000000 and region_size >= aligned_size:
+                found = find_zero_buffer_in_region(mem, gva, region_size, aligned_size, near_va + 0x1000)
+                if found is not None:
+                    return found
+
+    for gva, region_size in regions:
+        if gva < 0x80000000 or gva >= 0xF0000000 or region_size < aligned_size:
+            continue
+        if 0x82000000 <= gva < 0x84000000:
+            continue
+        found = find_zero_buffer_in_region(mem, gva, region_size, aligned_size)
+        if found is not None:
+            return found
     raise RuntimeError("Could not find a mapped writable guest buffer for relocated GSC injection.")
 
 
