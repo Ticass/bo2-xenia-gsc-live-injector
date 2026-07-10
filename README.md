@@ -11,6 +11,17 @@ Current flow:
 5. Click `Compile + Inject`.
 6. Load or restart the map.
 
+## Freeze Probe
+
+If a build freezes during map/session load, choose the same target you injected and click `Freeze Probe`.
+It records for 120 seconds while you reproduce the freeze, then writes a report under:
+
+```text
+Documents\BO2 GSC Live Injector\freeze_reports
+```
+
+The probe samples the live GSC table entry, object pointer, object size/name, Xenia process CPU time, the last injection config, and recent Xenia log output. Send the `.txt` summary first; keep the matching `.json` file for deeper debugging.
+
 The tool preserves the stock `_callbacksetup.gsc` template for the selected mode, inserts a thread call to your entry function inside `codecallback_startgametype`, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live `_callbacksetup` GSC object, and injects the compiled object.
 For the MP `_globallogic_player.gsc` fallback, the tool preserves the stock player gametype logic and inserts the entry thread inside `_globallogic_player::callback_playerconnect()` instead. `_objpoints.gsc` remains available for diagnostics, but the app blocks relocated MP startup-target injections because they can crash during system-link map load.
 When multiple Xenia processes are open, the injector checks each one and connects to the process that actually has an Xbox guest image mapped.
@@ -31,6 +42,7 @@ The PySide6/Qt interface includes:
 - Smart indentation on Enter and four-space Tab insertion
 - BO2-style dark/orange theme
 - Target/sidebar controls
+- Freeze Probe capture button
 - Live inspector panel for process, target object, table entry, active buffer, object size, and blob size
 - Bottom console log
 

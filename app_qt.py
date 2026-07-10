@@ -298,13 +298,15 @@ class InjectorWindow(QMainWindow):
         self.entry_function = QLineEdit("codex_main")
         layout.addWidget(self.entry_function)
         self.detect_btn = QPushButton("Detect Xenia")
+        self.probe_btn = QPushButton("Freeze Probe")
         self.inject_btn = QPushButton("Compile + Inject")
         self.restore_btn = QPushButton("Restore Backup")
         self.inject_btn.setObjectName("PrimaryButton")
-        for btn in (self.detect_btn, self.inject_btn, self.restore_btn):
+        for btn in (self.detect_btn, self.probe_btn, self.inject_btn, self.restore_btn):
             btn.setMinimumHeight(40)
             layout.addWidget(btn)
         self.detect_btn.clicked.connect(self.detect)
+        self.probe_btn.clicked.connect(self.freeze_probe)
         self.inject_btn.clicked.connect(self.inject)
         self.restore_btn.clicked.connect(self.restore)
         layout.addStretch()
@@ -390,7 +392,7 @@ class InjectorWindow(QMainWindow):
         """)
 
     def set_busy(self, busy: bool) -> None:
-        for btn in (self.detect_btn, self.inject_btn, self.restore_btn):
+        for btn in (self.detect_btn, self.probe_btn, self.inject_btn, self.restore_btn):
             btn.setEnabled(not busy)
         self.status_pill.setText("WORKING" if busy else "READY")
         self.status_pill.setStyleSheet(f"background: {'#3a2b18' if busy else '#193522'}; color: {'#ffcb6b' if busy else GREEN};")
@@ -455,6 +457,21 @@ class InjectorWindow(QMainWindow):
 
     def inject(self) -> None:
         self.run_worker(self._inject)
+
+    def freeze_probe(self) -> None:
+        self.run_worker(self._freeze_probe)
+
+    def _freeze_probe(self) -> None:
+        target = self.current_target()
+        self.signals.log.emit(
+            f"Starting BO2 freeze probe for {target}. Reproduce the freeze now; this records for 120 seconds."
+        )
+        report = backend.run_freeze_probe(target, duration_seconds=120, interval_seconds=1.0)
+        self.signals.log.emit(
+            "Freeze probe complete.\n"
+            + "\n".join(f"- {item}" for item in report.get("findings", []))
+            + f"\nReport: {report['txt_path']}\nRaw JSON: {report['json_path']}"
+        )
 
     def _inject(self) -> None:
         code = self.editor.toPlainText().strip()

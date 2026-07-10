@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import BOTH, END, INSERT, LEFT, RIGHT, TOP, X, Button, Canvas, Frame, Label, Listbox, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox, scrolledtext, ttk
@@ -43,6 +44,14 @@ k32.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_vo
 k32.WriteProcessMemory.restype = wintypes.BOOL
 k32.VirtualProtectEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
 k32.VirtualProtectEx.restype = wintypes.BOOL
+k32.GetProcessTimes.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+]
+k32.GetProcessTimes.restype = wintypes.BOOL
 
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
@@ -1065,6 +1074,232 @@ def find_quick_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
         f"Fast detect could not validate {target_name}. The script may not be mapped yet, "
         "or this build needs the deeper scan used by Compile + Inject."
     )
+
+
+def _filetime_to_seconds(ft: wintypes.FILETIME) -> float:
+    ticks = (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+    return ticks / 10_000_000.0
+
+
+def process_cpu_seconds(handle) -> float | None:
+    created = wintypes.FILETIME()
+    exited = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not k32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+        return None
+    return _filetime_to_seconds(kernel) + _filetime_to_seconds(user)
+
+
+def _walk_recent_logs(root: Path, max_depth: int = 4) -> list[Path]:
+    if not root.exists():
+        return []
+    out: list[Path] = []
+    root = root.resolve()
+    for current, dirs, files in os.walk(root):
+        try:
+            current_path = Path(current)
+            depth = len(current_path.relative_to(root).parts)
+        except ValueError:
+            depth = 0
+        if depth >= max_depth:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if d.lower() not in {".git", "node_modules", "__pycache__", "build", "dist"}]
+        for name in files:
+            low = name.lower()
+            if low == "xenia.log" or (low.startswith("xenia") and low.endswith(".log")):
+                out.append(current_path / name)
+    return out
+
+
+def find_recent_xenia_logs(limit: int = 6) -> list[Path]:
+    roots = [Path.cwd(), Path("C:/GAMES"), Path.home() / "Downloads", user_dir()]
+    seen: set[str] = set()
+    logs: list[Path] = []
+    for root in roots:
+        try:
+            found = _walk_recent_logs(root, max_depth=4)
+        except OSError:
+            continue
+        for path in found:
+            key = str(path).lower()
+            if key not in seen:
+                seen.add(key)
+                logs.append(path)
+    logs = [p for p in logs if p.exists()]
+    logs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return logs[:limit]
+
+
+def read_log_tail(path: Path, max_bytes: int = 80000) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+        return data.decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _safe_hex(value) -> str:
+    return f"0x{value:X}" if isinstance(value, int) else "-"
+
+
+def read_gsc_entry_snapshot(mem: GuestMemory, target_name: str, entry: dict | None) -> dict:
+    snap: dict = {
+        "target": target_name,
+        "entry_source": entry.get("source") if entry else None,
+        "ok": False,
+    }
+    if entry is None:
+        snap["error"] = "no resolved live table entry"
+        return snap
+    try:
+        table_size = mem.read_u32(entry["size_va"])
+        table_buffer = mem.read_u32(entry["buffer_va"])
+        snap.update(
+            {
+                "entry_va": _safe_hex(entry["entry_va"]),
+                "size_va": _safe_hex(entry["size_va"]),
+                "buffer_va": _safe_hex(entry["buffer_va"]),
+                "expected_object_va": _safe_hex(entry["object_va"]),
+                "expected_object_size": _safe_hex(entry["object_size"]),
+                "table_size": _safe_hex(table_size),
+                "table_buffer": _safe_hex(table_buffer),
+                "table_buffer_matches_expected": table_buffer == entry["object_va"],
+            }
+        )
+        magic = mem.read(table_buffer, 4)
+        snap["magic"] = magic.hex()
+        snap["magic_ok"] = magic == GSC_MAGIC
+        if magic == GSC_MAGIC:
+            snap["object_size"] = _safe_hex(object_size_from_header(mem, table_buffer))
+            snap["object_name"] = object_name_from_header(mem, table_buffer)
+            snap["object_name_matches_target"] = gsc_name_matches(snap["object_name"], target_name)
+        snap["ok"] = bool(snap.get("magic_ok")) and bool(snap.get("object_name_matches_target"))
+    except (OSError, RuntimeError) as exc:
+        snap["error"] = str(exc)
+    return snap
+
+
+def analyze_probe(samples: list[dict], log_text: str) -> list[str]:
+    findings: list[str] = []
+    if samples:
+        bad = [s for s in samples if not s.get("gsc", {}).get("ok")]
+        if bad:
+            findings.append(f"{len(bad)}/{len(samples)} GSC table samples were invalid or unreadable.")
+        buffers = {s.get("gsc", {}).get("table_buffer") for s in samples if s.get("gsc", {}).get("table_buffer")}
+        sizes = {s.get("gsc", {}).get("table_size") for s in samples if s.get("gsc", {}).get("table_size")}
+        if len(buffers) > 1:
+            findings.append(f"Live table buffer changed during probe: {', '.join(sorted(buffers))}.")
+        if len(sizes) > 1:
+            findings.append(f"Live table size changed during probe: {', '.join(sorted(sizes))}.")
+        cpu_values = [s.get("cpu_seconds") for s in samples if isinstance(s.get("cpu_seconds"), (int, float))]
+        if len(cpu_values) >= 2:
+            delta = cpu_values[-1] - cpu_values[0]
+            if delta < 0.25:
+                findings.append("Xenia process CPU time barely advanced; this looks like a hard stall or suspended process.")
+    low_log = log_text.lower()
+    patterns = [
+        "terminal script error",
+        "assert fail",
+        "access violation",
+        "guest has crashed",
+        "failed to find function",
+        "could not find script",
+        "xsessionstart",
+        "localfs_pos",
+        "localfs",
+    ]
+    for pattern in patterns:
+        if pattern in low_log:
+            findings.append(f"Xenia log contains '{pattern}'.")
+    if not findings:
+        findings.append("No obvious pointer corruption or known crash string was captured in this probe.")
+    return findings
+
+
+def run_freeze_probe(target_name: str, duration_seconds: int = 120, interval_seconds: float = 1.0) -> dict:
+    report_dir = user_dir() / "freeze_reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    mem = GuestMemory()
+    samples: list[dict] = []
+    entry: dict | None = None
+    entry_error = ""
+    logs = find_recent_xenia_logs()
+    initial_log_sizes = {str(p): p.stat().st_size for p in logs if p.exists()}
+    try:
+        process_info = mem.open()
+        try:
+            entry = find_live_gsc_entry(mem, target_name)
+        except RuntimeError as exc:
+            entry_error = str(exc)
+        start = time.monotonic()
+        while time.monotonic() - start < duration_seconds:
+            sample = {
+                "t": round(time.monotonic() - start, 3),
+                "wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "cpu_seconds": process_cpu_seconds(mem.handle),
+                "gsc": read_gsc_entry_snapshot(mem, target_name, entry),
+            }
+            samples.append(sample)
+            time.sleep(interval_seconds)
+    finally:
+        mem.close()
+
+    log_chunks: dict[str, str] = {}
+    for path in logs:
+        before = initial_log_sizes.get(str(path), 0)
+        try:
+            size = path.stat().st_size
+            if size > before:
+                with path.open("rb") as fh:
+                    fh.seek(before)
+                    data = fh.read(120000)
+                text = data.decode("utf-8", "replace")
+            else:
+                text = read_log_tail(path, 40000)
+            log_chunks[str(path)] = text[-120000:]
+        except OSError as exc:
+            log_chunks[str(path)] = f"<read failed: {exc}>"
+    combined_log = "\n".join(log_chunks.values())
+    cfg_path = user_dir() / "last_injection.json"
+    cache_path = address_cache_path()
+    report = {
+        "version": 1,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "target": target_name,
+        "duration_seconds": duration_seconds,
+        "process": process_info if "process_info" in locals() else "",
+        "entry": entry,
+        "entry_error": entry_error,
+        "last_injection": json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else None,
+        "address_cache_path": str(cache_path),
+        "logs": {str(p): {"size_before": initial_log_sizes.get(str(p), 0), "size_after": p.stat().st_size if p.exists() else 0} for p in logs},
+        "samples": samples,
+        "findings": analyze_probe(samples, combined_log),
+        "log_tail": log_chunks,
+    }
+    json_path = report_dir / f"freeze_probe_{stamp}.json"
+    txt_path = report_dir / f"freeze_probe_{stamp}.txt"
+    json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    lines = [
+        "BO2 Xenia GSC Freeze Probe",
+        f"Target: {target_name}",
+        f"Process: {report['process']}",
+        f"Entry error: {entry_error or '-'}",
+        "",
+        "Findings:",
+        *[f"- {item}" for item in report["findings"]],
+        "",
+        f"JSON report: {json_path}",
+    ]
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report["json_path"] = str(json_path)
+    report["txt_path"] = str(txt_path)
+    return report
 
 
 DEFAULT_CODE = """codex_main()
