@@ -24,7 +24,7 @@ if (-not (Test-Path $Exe)) {
   throw "Build failed; exe not found: $Exe"
 }
 
-$Version = "v0.4.9"
+$Version = "v0.4.10"
 $Zip = Join-Path $Root "release\BO2GscLiveInjector-$Version.zip"
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
 Compress-Archive -Path $Exe, (Join-Path $Root "README.md") -DestinationPath $Zip

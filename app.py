@@ -689,16 +689,21 @@ def find_live_gsc_object(mem: GuestMemory, target_name: str) -> tuple[int, int]:
 
 
 def gsc_object_aliases(obj_va: int) -> list[int]:
-    aliases = [obj_va]
-    for delta in (-0x20000000, 0x20000000):
-        alias = obj_va + delta
+    aliases: list[int] = []
+    low = obj_va & 0x1FFFFFFF
+    for high in (0x80000000, 0xA0000000, 0xC0000000, 0xE0000000):
+        alias = high | low
         if 0x80000000 <= alias < 0xF0000000 and alias not in aliases:
             aliases.append(alias)
+    if obj_va not in aliases:
+        aliases.insert(0, obj_va)
+    else:
+        aliases.insert(0, aliases.pop(aliases.index(obj_va)))
     return aliases
 
 
 def find_table_candidates_for_object(mem: GuestMemory, obj_va: int, obj_size: int, source: str) -> list[dict]:
-    refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=128) if r < 0x90000000 and (r & 3) == 0]
+    refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=256) if 0x80000000 <= r < 0xF0000000 and (r & 3) == 0]
     candidates: list[dict] = []
     for ref in refs:
         try:
@@ -706,7 +711,7 @@ def find_table_candidates_for_object(mem: GuestMemory, obj_va: int, obj_size: in
             name_ptr = mem.read_u32(ref - 8)
         except OSError:
             continue
-        if size == obj_size and 0x80000000 <= name_ptr < 0xF0000000:
+        if size == obj_size and (name_ptr == 0 or 0x80000000 <= name_ptr < 0xF0000000):
             candidates.append(
                 {
                     "entry_va": ref - 8,
