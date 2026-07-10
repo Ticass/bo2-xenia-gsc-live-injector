@@ -546,6 +546,13 @@ SCRIPT_TARGETS = {
     ("MP", "_callbacksetup.gsc"): "maps/mp/gametypes/_callbacksetup.gsc",
     ("MP", "_objpoints.gsc"): "maps/mp/gametypes/_objpoints.gsc",
     ("MP", "_globallogic.gsc"): "maps/mp/gametypes/_globallogic.gsc",
+    ("MP", "_globallogic_player.gsc"): "maps/mp/gametypes/_globallogic_player.gsc",
+}
+
+INPLACE_ONLY_TARGETS = {
+    "maps/mp/gametypes/_objpoints.gsc",
+    "maps/mp/gametypes/_globallogic.gsc",
+    "maps/mp/gametypes/_globallogic_player.gsc",
 }
 
 
@@ -645,6 +652,27 @@ def patch_globallogic_template(user_code: str, entry_function: str) -> tuple[Pat
     return source, target
 
 
+def patch_globallogic_player_template(user_code: str, entry_function: str) -> tuple[Path, str]:
+    target = target_for_script("MP", "_globallogic_player.gsc")
+    template = app_dir() / "templates" / "mp" / "_globallogic_player.gsc"
+    text = template.read_text(encoding="utf-8", errors="replace")
+    marker = "    // CODEX_GLOBALLOGIC_PLAYER_CONNECT"
+    launcher = (
+        "    if ( !isdefined( self.codex_injector_started ) )\n"
+        "    {\n"
+        "        self.codex_injector_started = 1;\n"
+        f"        self thread {entry_function}();\n"
+        "    }"
+    )
+    if marker not in text:
+        raise RuntimeError("Globallogic player template patch point not found.")
+    out_dir = user_dir() / "build"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    source = out_dir / "_globallogic_player_mp_patched.gsc"
+    source.write_text(text.replace(marker, launcher).rstrip() + "\n\n" + user_code.rstrip() + "\n", encoding="utf-8", newline="\n")
+    return source, target
+
+
 def patch_template_for_target(game_type: str, script_name: str, user_code: str, entry_function: str) -> tuple[Path, str]:
     if script_name == "_callbacksetup.gsc":
         return patch_callbacksetup_template(game_type, user_code, entry_function)
@@ -652,6 +680,8 @@ def patch_template_for_target(game_type: str, script_name: str, user_code: str, 
         return patch_objpoints_template(user_code, entry_function)
     if game_type.upper() == "MP" and script_name == "_globallogic.gsc":
         return patch_globallogic_template(user_code, entry_function)
+    if game_type.upper() == "MP" and script_name == "_globallogic_player.gsc":
+        return patch_globallogic_player_template(user_code, entry_function)
     raise RuntimeError(f"Unsupported target: {game_type} {script_name}")
 
 

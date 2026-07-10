@@ -6,13 +6,13 @@ Current flow:
 
 1. Launch Xenia and reach the MP or Zombies main menu.
 2. Choose `ZM` or `MP`.
-3. Choose a script file. Use `_callbacksetup.gsc` by default. For MP alpha/system-link builds that do not load `_callbacksetup.gsc`, use `_globallogic.gsc`.
+3. Choose a script file. Use `_callbacksetup.gsc` by default. For MP alpha/system-link builds that do not load `_callbacksetup.gsc`, use `_globallogic_player.gsc`.
 4. Write GSC functions in the editor. The default entry function is `codex_main`.
 5. Click `Compile + Inject`.
 6. Load or restart the map.
 
 The tool preserves the stock `_callbacksetup.gsc` template for the selected mode, inserts a thread call to your entry function inside `codecallback_startgametype`, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live `_callbacksetup` GSC object, and injects the compiled object.
-For the MP `_globallogic.gsc` fallback, the tool preserves the stock global gametype logic and inserts the entry thread inside `_globallogic::init()` instead. `_objpoints.gsc` remains available for diagnostics, but the app blocks relocated `_objpoints` injections because they can crash during system-link map load.
+For the MP `_globallogic_player.gsc` fallback, the tool preserves the stock player gametype logic and inserts the entry thread inside `_globallogic_player::callback_playerconnect()` instead. `_objpoints.gsc` remains available for diagnostics, but the app blocks relocated MP startup-target injections because they can crash during system-link map load.
 When multiple Xenia processes are open, the injector checks each one and connects to the process that actually has an Xbox guest image mapped.
 
 Small compiled scripts are written in place after backing up the original object. Larger compiled scripts are relocated to a free guest-memory buffer and the live GSC table entry is patched to point at the relocated object, including its new size.
