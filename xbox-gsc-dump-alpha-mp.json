@@ -1,0 +1,54 @@
+{
+  "Build": "Multiplayer/Milestones/Alpha,1276000",
+  "GscVmRevision": 5,
+  "Files": [
+    {
+      "Name": "maps/mp/gametypes/_callbacksetup.gsc",
+      "Pointer": 2198951624,
+      "Buffer": 2780254720,
+      "Size": 4890
+    },
+    {
+      "Name": "maps/mp/gametypes/_globallogic.gsc",
+      "Pointer": 2198951768,
+      "Buffer": 2780400736,
+      "Size": 46578
+    },
+    {
+      "Name": "maps/mp/gametypes/_globallogic_player.gsc",
+      "Pointer": 2198951816,
+      "Buffer": 2780475296,
+      "Size": 46994
+    },
+    {
+      "Name": "maps/mp/gametypes/_objpoints.gsc",
+      "Pointer": 2198951984,
+      "Buffer": 2780659936,
+      "Size": 2418
+    },
+    {
+      "Name": "maps/mp/gametypes/_callbacksetup.gsc",
+      "Pointer": 2467387080,
+      "Buffer": 2780254720,
+      "Size": 4890
+    },
+    {
+      "Name": "maps/mp/gametypes/_globallogic.gsc",
+      "Pointer": 2467387224,
+      "Buffer": 2780400736,
+      "Size": 46578
+    },
+    {
+      "Name": "maps/mp/gametypes/_globallogic_player.gsc",
+      "Pointer": 2467387272,
+      "Buffer": 2780475296,
+      "Size": 46994
+    },
+    {
+      "Name": "maps/mp/gametypes/_objpoints.gsc",
+      "Pointer": 2467387440,
+      "Buffer": 2780659936,
+      "Size": 2418
+    }
+  ]
+}

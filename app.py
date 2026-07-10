@@ -23,6 +23,13 @@ PE_SIG = bytes.fromhex("50450000")
 GSC_OBJ_NAME_FIELD_OFFSET = 0x30
 GSC_OBJ_SIZE_FIELD_OFFSET = 0x24
 GSC_MAGIC = b"\x80GSC"
+GSC_MAGIC_SIZE = 8
+T6_RETAIL_VM_MAGIC = bytes.fromhex("804753430D0A0006")
+T6_ALPHA_VM_MAGIC = bytes.fromhex("804753430D0A0005")
+VM_AUTO = "Auto Detect"
+VM_ALPHA = "Alpha v5"
+VM_RETAIL = "Retail v6"
+VM_CHOICES = (VM_AUTO, VM_ALPHA, VM_RETAIL)
 MAX_RELOCATED_BLOB_SIZE = 0x200000
 MAX_INPLACE_EXPANSION_SIZE = 0x4000
 
@@ -53,6 +60,12 @@ k32.GetProcessTimes.argtypes = [
     ctypes.POINTER(wintypes.FILETIME),
 ]
 k32.GetProcessTimes.restype = wintypes.BOOL
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+shell32.SHGetFolderPathW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR]
+shell32.SHGetFolderPathW.restype = ctypes.c_long
+
+CSIDL_PERSONAL = 0x0005
+SHGFP_TYPE_CURRENT = 0
 
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
@@ -88,7 +101,11 @@ def app_dir() -> Path:
 
 
 def user_dir() -> Path:
-    path = Path.home() / "Documents" / "BO2 GSC Live Injector"
+    documents = Path.home() / "Documents"
+    buffer = ctypes.create_unicode_buffer(32768)
+    if shell32.SHGetFolderPathW(None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buffer) == 0 and buffer.value:
+        documents = Path(buffer.value)
+    path = documents / "BO2 GSC Live Injector"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -100,16 +117,22 @@ def address_cache_path() -> Path:
 def load_address_cache() -> dict:
     path = address_cache_path()
     if not path.exists():
-        return {"version": 1, "entries": {}}
+        data = {"version": 2, "entries": {}}
+        save_address_cache(data)
+        return data
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {"version": 1, "entries": {}}
-        data.setdefault("version", 1)
+            data = {"version": 2, "entries": {}}
+            save_address_cache(data)
+            return data
+        data.setdefault("version", 2)
         data.setdefault("entries", {})
         return data
     except (OSError, json.JSONDecodeError):
-        return {"version": 1, "entries": {}}
+        data = {"version": 2, "entries": {}}
+        save_address_cache(data)
+        return data
 
 
 def save_address_cache(data: dict) -> None:
@@ -455,6 +478,80 @@ def object_size_from_blob(bytecode: bytes) -> int:
     return len(bytecode)
 
 
+def assert_gsc_vm_compatible(mem: "GuestMemory", object_va: int, bytecode: bytes) -> None:
+    """Refuse cross-revision bytecode before any live-memory write.
+
+    Pre-release T6 builds use an older VM revision (observed as 0x0005 in the
+    2012-07-20 Alpha), while gsc-tool's retail T6 backend emits revision 0x0006.
+    The revision is part of the eight-byte GSC magic and is not a cosmetic
+    version field: accepting a different revision can hang the VM during link.
+    """
+    if len(bytecode) < GSC_MAGIC_SIZE:
+        raise RuntimeError("Compiled GSC is too small to contain a VM signature.")
+    live_magic = mem.read(object_va, GSC_MAGIC_SIZE)
+    compiled_magic = bytecode[:GSC_MAGIC_SIZE]
+    if live_magic != compiled_magic:
+        raise RuntimeError(
+            "GSC VM revision mismatch; injection was blocked before writing memory. "
+            f"The loaded object uses {live_magic.hex(' ')}, but the compiler emitted "
+            f"{compiled_magic.hex(' ')}. This build needs a matching compiler/opcode table; "
+            "changing the version byte alone is unsafe."
+        )
+
+
+def adapt_compiled_gsc_to_live_vm(mem: "GuestMemory", object_va: int, bytecode: bytes) -> bytes:
+    """Adapt retail T6 output to the verified 2012 Alpha VM revision.
+
+    The compiler-enabled Alpha executable's EmitOpcode call sites establish
+    that revision 5 uses the same complete 0x00..0x7c opcode mapping as the
+    retail T6 backend. Its GSC_OBJ header layout is also identical. Therefore
+    the only required serialization difference is the eight-byte VM magic.
+    Unknown source/destination revisions are deliberately rejected later by
+    assert_gsc_vm_compatible instead of being rewritten speculatively.
+    """
+    if len(bytecode) < GSC_MAGIC_SIZE:
+        return bytecode
+    live_magic = mem.read(object_va, GSC_MAGIC_SIZE)
+    compiled_magic = bytecode[:GSC_MAGIC_SIZE]
+    if live_magic == T6_ALPHA_VM_MAGIC and compiled_magic == T6_RETAIL_VM_MAGIC:
+        return T6_ALPHA_VM_MAGIC + bytecode[GSC_MAGIC_SIZE:]
+    return bytecode
+
+
+def is_verified_alpha_vm(mem: "GuestMemory", object_va: int) -> bool:
+    return mem.read(object_va, GSC_MAGIC_SIZE) == T6_ALPHA_VM_MAGIC
+
+
+def prepare_compiled_gsc_for_vm(
+    mem: "GuestMemory", object_va: int, bytecode: bytes, vm_choice: str
+) -> bytes:
+    """Select output VM while independently validating the target object.
+
+    Forced modes intentionally override the live revision byte, but never the
+    object-type check. This prevents a stale cache/table result from turning a
+    forced injection into a write over PPC code or unrelated guest memory.
+    """
+    if vm_choice not in VM_CHOICES:
+        raise RuntimeError(f"Unknown VM selection: {vm_choice}")
+    if len(bytecode) < GSC_MAGIC_SIZE:
+        raise RuntimeError("Compiled GSC is too small to contain a VM signature.")
+    live_magic = mem.read(object_va, GSC_MAGIC_SIZE)
+    if live_magic[:4] != GSC_MAGIC:
+        raise RuntimeError(
+            "Resolved target is stale or invalid; injection was blocked before writing memory. "
+            f"Expected a GSC object at 0x{object_va:X}, but found {live_magic.hex(' ')}. "
+            "Restart Xenia or clear address_cache.json, then run Detect Xenia again."
+        )
+    if vm_choice == VM_AUTO:
+        bytecode = adapt_compiled_gsc_to_live_vm(mem, object_va, bytecode)
+        assert_gsc_vm_compatible(mem, object_va, bytecode)
+        return bytecode
+    selected_magic = T6_ALPHA_VM_MAGIC if vm_choice == VM_ALPHA else T6_RETAIL_VM_MAGIC
+    if bytecode[:4] != GSC_MAGIC:
+        raise RuntimeError("Compiler output is not a T6 GSC object.")
+    return selected_magic + bytecode[GSC_MAGIC_SIZE:]
+
+
 def find_zero_run(data: bytes, needed: int) -> int:
     start = 0
     marker = b"\x00" * min(needed, 64)
@@ -579,16 +676,7 @@ SCRIPT_TARGETS = {
     ("ZM", "_callbacksetup.gsc"): "maps/mp/gametypes_zm/_callbacksetup.gsc",
     ("MP", "_callbacksetup.gsc"): "maps/mp/gametypes/_callbacksetup.gsc",
     ("MP", "_objpoints.gsc"): "maps/mp/gametypes/_objpoints.gsc",
-    ("MP", "_globallogic.gsc"): "maps/mp/gametypes/_globallogic.gsc",
-    ("MP", "_globallogic_player.gsc"): "maps/mp/gametypes/_globallogic_player.gsc",
 }
-
-INPLACE_ONLY_TARGETS = {
-    "maps/mp/gametypes/_objpoints.gsc",
-    "maps/mp/gametypes/_globallogic.gsc",
-    "maps/mp/gametypes/_globallogic_player.gsc",
-}
-
 
 def script_choices_for_game_type(game_type: str) -> list[str]:
     gt = game_type.upper()
@@ -661,57 +749,11 @@ def patch_objpoints_template(user_code: str, entry_function: str) -> tuple[Path,
     return source, target
 
 
-def patch_globallogic_template(user_code: str, entry_function: str) -> tuple[Path, str]:
-    target = target_for_script("MP", "_globallogic.gsc")
-    template = app_dir() / "templates" / "mp" / "_globallogic.gsc"
-    text = template.read_text(encoding="utf-8", errors="replace")
-    marker = "    // CODEX_GLOBALLOGIC_LAUNCHER"
-    launcher = (
-        "    if ( !isdefined( level.codex_injector_started ) )\n"
-        "    {\n"
-        "        level.codex_injector_started = 1;\n"
-        f"        level thread {entry_function}();\n"
-        "    }"
-    )
-    if marker not in text:
-        raise RuntimeError("Globallogic template patch point not found.")
-    out_dir = user_dir() / "build"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    source = out_dir / "_globallogic_mp_patched.gsc"
-    source.write_text(text.replace(marker, launcher).rstrip() + "\n\n" + user_code.rstrip() + "\n", encoding="utf-8", newline="\n")
-    return source, target
-
-
-def patch_globallogic_player_template(user_code: str, entry_function: str) -> tuple[Path, str]:
-    target = target_for_script("MP", "_globallogic_player.gsc")
-    template = app_dir() / "templates" / "mp" / "_globallogic_player.gsc"
-    text = template.read_text(encoding="utf-8", errors="replace")
-    marker = "    // CODEX_GLOBALLOGIC_PLAYER_CONNECT"
-    launcher = (
-        "    if ( !isdefined( self.codex_injector_started ) )\n"
-        "    {\n"
-        "        self.codex_injector_started = 1;\n"
-        f"        self thread {entry_function}();\n"
-        "    }"
-    )
-    if marker not in text:
-        raise RuntimeError("Globallogic player template patch point not found.")
-    out_dir = user_dir() / "build"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    source = out_dir / "_globallogic_player_mp_patched.gsc"
-    source.write_text(text.replace(marker, launcher).rstrip() + "\n\n" + user_code.rstrip() + "\n", encoding="utf-8", newline="\n")
-    return source, target
-
-
 def patch_template_for_target(game_type: str, script_name: str, user_code: str, entry_function: str) -> tuple[Path, str]:
     if script_name == "_callbacksetup.gsc":
         return patch_callbacksetup_template(game_type, user_code, entry_function)
     if game_type.upper() == "MP" and script_name == "_objpoints.gsc":
         return patch_objpoints_template(user_code, entry_function)
-    if game_type.upper() == "MP" and script_name == "_globallogic.gsc":
-        return patch_globallogic_template(user_code, entry_function)
-    if game_type.upper() == "MP" and script_name == "_globallogic_player.gsc":
-        return patch_globallogic_player_template(user_code, entry_function)
     raise RuntimeError(f"Unsupported target: {game_type} {script_name}")
 
 
@@ -729,15 +771,28 @@ def default_gsc_db_path_for_target(target_name: str) -> Path:
     return app_dir() / stem
 
 
-def find_gsc_database_item(target_name: str) -> dict | None:
-    path = default_gsc_db_path_for_target(target_name)
-    if not path.exists():
-        return None
+def gsc_db_paths_for_target(target_name: str) -> list[Path]:
+    """Return build-specific databases before the retail fallback database."""
+    if "/gametypes_zm/" in target_name.replace("\\", "/").lower():
+        return [default_gsc_db_path_for_target(target_name)]
+    return [app_dir() / "xbox-gsc-dump-alpha-mp.json", default_gsc_db_path_for_target(target_name)]
+
+
+def find_gsc_database_items(target_name: str) -> list[dict]:
     want = target_name.replace("\\", "/").lower()
-    for item in load_gsc_database(path):
-        if item.get("Name", "").replace("\\", "/").lower() == want:
-            return item
-    return None
+    matches: list[dict] = []
+    for path in gsc_db_paths_for_target(target_name):
+        if not path.exists():
+            continue
+        for item in load_gsc_database(path):
+            if item.get("Name", "").replace("\\", "/").lower() == want:
+                matches.append(item)
+    return matches
+
+
+def find_gsc_database_item(target_name: str) -> dict | None:
+    items = find_gsc_database_items(target_name)
+    return items[0] if items else None
 
 
 def object_name_from_header(mem: GuestMemory, header_va: int) -> str:
@@ -989,37 +1044,36 @@ def remember_gsc_entry(mem: GuestMemory, target_name: str, entry: dict) -> None:
 
 
 def database_gsc_entry(mem: GuestMemory, target_name: str) -> dict | None:
-    item = find_gsc_database_item(target_name)
-    if item is None:
-        return None
-    pointer_va = int(item["Pointer"])
-    try:
-        obj_va = mem.read_u32(pointer_va)
-        if not (0x80000000 <= obj_va < 0xF0000000):
-            return None
-        if mem.read(obj_va, 4) != GSC_MAGIC:
-            return None
-        obj_size = object_size_from_header(mem, obj_va)
-        if not gsc_name_matches(object_name_from_header(mem, obj_va), target_name):
-            return None
-        size_va = pointer_va - 4
-        table_size = mem.read_u32(size_va)
-        if table_size != obj_size:
-            return None
-        name_ptr_va = pointer_va - 8
-        name_ptr = mem.read_u32(name_ptr_va)
-        return {
-            "entry_va": pointer_va - 8,
-            "name_ptr_va": name_ptr_va,
-            "size_va": size_va,
-            "buffer_va": pointer_va,
-            "name_ptr": name_ptr,
-            "object_va": obj_va,
-            "object_size": obj_size,
-            "source": "database",
-        }
-    except (OSError, RuntimeError, KeyError, TypeError, ValueError):
-        return None
+    for item in find_gsc_database_items(target_name):
+        pointer_va = int(item["Pointer"])
+        try:
+            obj_va = mem.read_u32(pointer_va)
+            if not (0x80000000 <= obj_va < 0xF0000000):
+                continue
+            if mem.read(obj_va, 4) != GSC_MAGIC:
+                continue
+            obj_size = object_size_from_header(mem, obj_va)
+            if not gsc_name_matches(object_name_from_header(mem, obj_va), target_name):
+                continue
+            size_va = pointer_va - 4
+            table_size = mem.read_u32(size_va)
+            if table_size != obj_size:
+                continue
+            name_ptr_va = pointer_va - 8
+            name_ptr = mem.read_u32(name_ptr_va)
+            return {
+                "entry_va": pointer_va - 8,
+                "name_ptr_va": name_ptr_va,
+                "size_va": size_va,
+                "buffer_va": pointer_va,
+                "name_ptr": name_ptr,
+                "object_va": obj_va,
+                "object_size": obj_size,
+                "source": "database",
+            }
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError):
+            continue
+    return None
 
 
 def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
@@ -1823,6 +1877,7 @@ class InjectorApp:
         self.root.title(APP_NAME)
         self.root.geometry("980x720")
         self.game_type = StringVar(value="ZM")
+        self.vm_choice = StringVar(value=VM_AUTO)
         self.status = StringVar(value="Ready. Launch Xenia and stay in the menu before injecting.")
         self.entry_function = StringVar(value="codex_main")
         self.restore_cfg: Path | None = None
@@ -1835,6 +1890,8 @@ class InjectorApp:
         ttk.Combobox(top, textvariable=self.game_type, values=["ZM", "MP"], width=6, state="readonly").pack(side=LEFT, padx=6)
         Label(top, text="Entry").pack(side=LEFT, padx=(14, 0))
         ttk.Entry(top, textvariable=self.entry_function, width=22).pack(side=LEFT, padx=6)
+        Label(top, text="GSC VM").pack(side=LEFT, padx=(14, 0))
+        ttk.Combobox(top, textvariable=self.vm_choice, values=list(VM_CHOICES), width=12, state="readonly").pack(side=LEFT, padx=6)
         Button(top, text="Detect Xenia", command=self.detect).pack(side=LEFT, padx=4)
         Button(top, text="Compile + Inject", command=self.inject).pack(side=LEFT, padx=4)
         Button(top, text="Restore", command=self.restore).pack(side=LEFT, padx=4)
@@ -1884,6 +1941,7 @@ class InjectorApp:
         code = self.editor.get("1.0", END).strip()
         if not code:
             raise RuntimeError("Editor is empty.")
+        vm_choice = self.vm_choice.get()
         source, target = patch_template(self.game_type.get(), code, self.entry_function.get().strip() or "codex_main")
         self.root.after(0, lambda: self.write_log(f"Compiling {target}..."))
         blob = run_gsc_tool_compile(source, target)
@@ -1894,6 +1952,8 @@ class InjectorApp:
         try:
             info = mem.open()
             obj_va, obj_span = find_live_gsc_object(mem, target)
+            blob = prepare_compiled_gsc_for_vm(mem, obj_va, blob, vm_choice)
+            compiled_path.write_bytes(blob)
             if len(blob) > obj_span:
                 raise RuntimeError(f"Compiled blob too large for live object: 0x{len(blob):X} > 0x{obj_span:X}")
             backup = mem.read(obj_va, obj_span)
@@ -1907,12 +1967,15 @@ class InjectorApp:
                 "backup_file": str(backup_path),
                 "compiled_file": str(compiled_path),
                 "script_len": f"0x{len(blob):X}",
+                "vm": vm_choice,
+                "vm_magic": blob[:GSC_MAGIC_SIZE].hex(" "),
             }
             cfg_path = user_dir() / "last_injection.json"
             cfg_path.write_text(json.dumps(cfg, indent=2))
             self.restore_cfg = cfg_path
             self.root.after(0, lambda: self.write_log(
-                f"{info}\nInjected {target}\nobject=0x{obj_va:X}, size=0x{obj_span:X}, blob=0x{len(blob):X}\nNow load/restart the map."
+                f"{info}\nInjected {target}\nobject=0x{obj_va:X}, size=0x{obj_span:X}, blob=0x{len(blob):X}, "
+                f"vm={vm_choice} ({blob[:GSC_MAGIC_SIZE].hex(' ')})\nNow load/restart the map."
             ))
         finally:
             mem.close()

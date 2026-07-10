@@ -229,6 +229,9 @@ class GscCodeEditor(QPlainTextEdit):
 class InjectorWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        # Materialize the user folder and virgin address cache on first launch,
+        # before Detect or Inject is pressed.
+        backend.load_address_cache()
         self.setWindowTitle(APP_TITLE)
         self.resize(1220, 780)
         self.restore_cfg: Path | None = None
@@ -294,6 +297,10 @@ class InjectorWindow(QMainWindow):
         layout.addWidget(self.script_file)
         self.game_type.currentTextChanged.connect(self.refresh_script_choices)
         self.refresh_script_choices()
+        layout.addWidget(QLabel("GSC VM"))
+        self.vm_choice = QComboBox()
+        self.vm_choice.addItems(backend.VM_CHOICES)
+        layout.addWidget(self.vm_choice)
         layout.addWidget(QLabel("ENTRY FUNCTION"))
         self.entry_function = QLineEdit("codex_main")
         layout.addWidget(self.entry_function)
@@ -356,7 +363,7 @@ class InjectorWindow(QMainWindow):
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
         self.info_labels: dict[str, QLabel] = {}
-        for key in ["Process", "Target", "Mode", "Entry", "Object", "Buffer", "Size", "Blob"]:
+        for key in ["Process", "Target", "VM", "Mode", "Entry", "Object", "Buffer", "Size", "Blob"]:
             k = QLabel(key.upper())
             k.setObjectName("Hint")
             v = QLabel("-")
@@ -436,15 +443,17 @@ class InjectorWindow(QMainWindow):
             info = mem.open()
             target = self.current_target()
             entry = backend.find_quick_gsc_entry(mem, target)
+            live_vm = mem.read(entry["object_va"], backend.GSC_MAGIC_SIZE).hex(" ")
             self.signals.log.emit(
                 f"{info}\nFound {target}\n"
                 f"entry=0x{entry['entry_va']:X}, object=0x{entry['object_va']:X}, "
-                f"size=0x{entry['object_size']:X}, source={entry.get('source', 'scan')}"
+                f"size=0x{entry['object_size']:X}, vm={live_vm}, source={entry.get('source', 'scan')}"
             )
             self.signals.info.emit(
                 {
                     "Process": info,
                     "Target": target,
+                    "VM": live_vm,
                     "Mode": entry.get("source", "scan"),
                     "Entry": f"0x{entry['entry_va']:X}",
                     "Object": f"0x{entry['object_va']:X}",
@@ -479,6 +488,7 @@ class InjectorWindow(QMainWindow):
             raise RuntimeError("Editor is empty.")
         target_mode = self.game_type.currentText()
         script_name = self.script_file.currentText()
+        vm_choice = self.vm_choice.currentText()
         entry = self.entry_function.text().strip() or "codex_main"
         source, target = backend.patch_template_for_target(target_mode, script_name, code, entry)
         self.signals.log.emit(f"Compiling {target}...")
@@ -486,13 +496,15 @@ class InjectorWindow(QMainWindow):
         blob_size = backend.object_size_from_blob(blob)
         compiled_stem = script_name.removesuffix(".gsc").lstrip("_")
         compiled_path = backend.user_dir() / "build" / f"{target_mode.lower()}_{compiled_stem}_injected.gsc"
-        compiled_path.write_bytes(blob)
         mem = backend.GuestMemory()
         try:
             info = mem.open()
             live_entry = backend.find_live_gsc_entry(mem, target)
             obj = live_entry["object_va"]
             size = live_entry["object_size"]
+            blob = backend.prepare_compiled_gsc_for_vm(mem, obj, blob, vm_choice)
+            blob_size = backend.object_size_from_blob(blob)
+            compiled_path.write_bytes(blob)
             needed_span = max(blob_size, len(blob))
             if needed_span <= size:
                 backup = mem.read(obj, size)
@@ -517,65 +529,33 @@ class InjectorWindow(QMainWindow):
                 }
                 buffer_va = obj
             else:
-                if target.replace("\\", "/").lower() in backend.INPLACE_ONLY_TARGETS:
-                    capacity = backend.find_inplace_expansion_capacity(mem, obj, size, needed_span)
-                    if needed_span <= capacity:
-                        backup = mem.read(obj, capacity)
-                        backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
-                        backup_path.write_bytes(backup)
-                        mem.write(obj, blob + (b"\x00" * (capacity - len(blob))))
-                        mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
-                        mode = "expanded in-place"
-                        cfg = {
-                            "mode": "expanded-inplace",
-                            "target_gsc": target,
-                            "entry_va": f"0x{live_entry['entry_va']:X}",
-                            "size_va": f"0x{live_entry['size_va']:X}",
-                            "object_va": f"0x{obj:X}",
-                            "object_size": f"0x{size:X}",
-                            "expanded_size": f"0x{capacity:X}",
-                            "old_size": f"0x{size:X}",
-                            "new_size": f"0x{blob_size:X}",
-                            "backup_file": str(backup_path),
-                            "compiled_file": str(compiled_path),
-                            "script_len": f"0x{blob_size:X}",
-                            "file_len": f"0x{len(blob):X}",
-                        }
-                        buffer_va = obj
-                    else:
-                        raise RuntimeError(
-                            f"Compiled {target} is larger than the live object "
-                            f"(0x{blob_size:X} > 0x{size:X}). Only 0x{capacity - size:X} bytes of safe "
-                            "zero padding were found after the object, and relocation is unsafe on system-link map load."
-                        )
-                else:
-                    if blob_size > backend.MAX_RELOCATED_BLOB_SIZE:
-                        raise RuntimeError(
-                            f"Compiled blob is too large for the relocation buffer: "
-                            f"0x{blob_size:X} > 0x{backend.MAX_RELOCATED_BLOB_SIZE:X}"
-                        )
-                    buffer_va = backend.find_relocation_buffer(mem, len(blob), obj)
-                    mem.write(buffer_va, b"\x00" * len(blob))
-                    mem.write(buffer_va, blob)
-                    mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
-                    mem.write(live_entry["buffer_va"], buffer_va.to_bytes(4, "big"))
-                    mode = "relocated"
-                    cfg = {
-                        "mode": "relocated",
-                        "target_gsc": target,
-                        "entry_va": f"0x{live_entry['entry_va']:X}",
-                        "size_va": f"0x{live_entry['size_va']:X}",
-                        "buffer_va": f"0x{live_entry['buffer_va']:X}",
-                        "old_size": f"0x{size:X}",
-                        "old_buffer": f"0x{obj:X}",
-                        "new_size": f"0x{blob_size:X}",
-                        "new_buffer": f"0x{buffer_va:X}",
-                        "object_va": f"0x{obj:X}",
-                        "object_size": f"0x{size:X}",
-                        "compiled_file": str(compiled_path),
-                        "script_len": f"0x{blob_size:X}",
-                        "file_len": f"0x{len(blob):X}",
-                    }
+                if blob_size > backend.MAX_RELOCATED_BLOB_SIZE:
+                    raise RuntimeError(
+                        f"Compiled blob is too large for the relocation buffer: "
+                        f"0x{blob_size:X} > 0x{backend.MAX_RELOCATED_BLOB_SIZE:X}"
+                    )
+                buffer_va = backend.find_relocation_buffer(mem, len(blob), obj)
+                mem.write(buffer_va, b"\x00" * len(blob))
+                mem.write(buffer_va, blob)
+                mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
+                mem.write(live_entry["buffer_va"], buffer_va.to_bytes(4, "big"))
+                mode = "relocated"
+                cfg = {
+                    "mode": "relocated",
+                    "target_gsc": target,
+                    "entry_va": f"0x{live_entry['entry_va']:X}",
+                    "size_va": f"0x{live_entry['size_va']:X}",
+                    "buffer_va": f"0x{live_entry['buffer_va']:X}",
+                    "old_size": f"0x{size:X}",
+                    "old_buffer": f"0x{obj:X}",
+                    "new_size": f"0x{blob_size:X}",
+                    "new_buffer": f"0x{buffer_va:X}",
+                    "object_va": f"0x{obj:X}",
+                    "object_size": f"0x{size:X}",
+                    "compiled_file": str(compiled_path),
+                    "script_len": f"0x{blob_size:X}",
+                    "file_len": f"0x{len(blob):X}",
+                }
             cfg_path = backend.user_dir() / "last_injection.json"
             cfg_path.write_text(json.dumps(cfg, indent=2))
             self.restore_cfg = cfg_path
@@ -583,13 +563,14 @@ class InjectorWindow(QMainWindow):
                 f"{info}\nInjected {target} ({mode})\n"
                 f"entry=0x{live_entry['entry_va']:X}, object=0x{obj:X}, buffer=0x{buffer_va:X}, "
                 f"object_size=0x{size:X}, blob=0x{blob_size:X}, file=0x{len(blob):X}, "
-                f"source={live_entry.get('source', 'scan')}\n"
+                f"vm={vm_choice}, magic={blob[:8].hex(' ')}, source={live_entry.get('source', 'scan')}\n"
                 f"Load/restart the map."
             )
             self.signals.info.emit(
                 {
                     "Process": info,
                     "Target": target,
+                    "VM": f"{vm_choice} ({blob[:8].hex(' ')})",
                     "Mode": mode,
                     "Entry": f"0x{live_entry['entry_va']:X}",
                     "Object": f"0x{obj:X}",
