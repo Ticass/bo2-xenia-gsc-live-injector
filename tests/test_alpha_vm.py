@@ -14,6 +14,29 @@ class FakeMemory:
         return self.magic[:size]
 
 
+class AddressedMemory:
+    """FakeMemory variant whose contents differ per guest address."""
+
+    def __init__(self, mapping: dict[int, bytes]):
+        self.mapping = mapping
+
+    def read(self, address: int, size: int) -> bytes:
+        try:
+            return self.mapping[address][:size]
+        except KeyError:
+            raise OSError(f"read failed at guest 0x{address:X}")
+
+
+class FakeCacheKeys:
+    exe_name = "xenia_canary.exe"
+
+    def cache_key(self, target_name: str) -> str:
+        return f"exe|0x100000000|{target_name}"
+
+    def stable_cache_key(self, target_name: str) -> str:
+        return f"exe|{target_name}"
+
+
 class AlphaVmTests(unittest.TestCase):
     def test_first_cache_load_creates_virgin_json(self):
         with TemporaryDirectory() as directory:
@@ -101,6 +124,80 @@ class AlphaVmTests(unittest.TestCase):
             app.prepare_compiled_gsc_for_vm(
                 memory, 0xA0000000, blob, app.VM_ALPHA
             )
+
+
+class FreshInstallResolutionTests(unittest.TestCase):
+    STALE_BYTES = bytes.fromhex("48C1EA0383E207E8")
+    TARGET = "maps/mp/gametypes/_objpoints.gsc"
+
+    def test_stale_cached_entry_is_evicted_and_rescanned(self):
+        blob = app.T6_RETAIL_VM_MAGIC + b"payload"
+        stale = {"object_va": 0xA5BD80E0, "source": "cache"}
+        fresh = {"object_va": 0x82000000, "source": "scan"}
+        memory = AddressedMemory({0xA5BD80E0: self.STALE_BYTES, 0x82000000: app.T6_ALPHA_VM_MAGIC})
+        with patch.object(app, "find_live_gsc_entry", side_effect=[stale, fresh]) as resolver, \
+                patch.object(app, "forget_gsc_entry") as forget:
+            entry, prepared = app.resolve_entry_and_prepare_blob(memory, self.TARGET, blob, app.VM_AUTO)
+        self.assertIs(entry, fresh)
+        self.assertEqual(prepared, app.T6_ALPHA_VM_MAGIC + b"payload")
+        forget.assert_called_once_with(memory, self.TARGET)
+        self.assertEqual(resolver.call_args.kwargs.get("force_scan"), True)
+
+    def test_fresh_scan_failure_is_not_retried(self):
+        blob = app.T6_RETAIL_VM_MAGIC + b"payload"
+        scanned = {"object_va": 0xA5BD80E0, "source": "scan"}
+        memory = AddressedMemory({0xA5BD80E0: self.STALE_BYTES})
+        with patch.object(app, "find_live_gsc_entry", return_value=scanned) as resolver:
+            with self.assertRaisesRegex(RuntimeError, "stale or invalid"):
+                app.resolve_entry_and_prepare_blob(memory, self.TARGET, blob, app.VM_AUTO)
+        resolver.assert_called_once()
+
+    def test_forget_gsc_entry_removes_cached_keys(self):
+        memory = FakeCacheKeys()
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "address_cache.json"
+            with patch.object(app, "address_cache_path", return_value=cache_path):
+                cache = app.load_address_cache()
+                cache["entries"][memory.cache_key(self.TARGET)] = {"object_va": "0x82000000"}
+                cache["entries"][memory.stable_cache_key(self.TARGET)] = {"object_va": "0x82000000"}
+                cache["entries"]["exe|other.gsc"] = {"object_va": "0x83000000"}
+                app.save_address_cache(cache)
+                app.forget_gsc_entry(memory, self.TARGET)
+                remaining = app.load_address_cache()["entries"]
+        self.assertEqual(list(remaining), ["exe|other.gsc"])
+
+    def test_quick_detect_falls_back_to_full_scan(self):
+        sentinel = {"object_va": 0x82000000, "source": "scan"}
+        memory = FakeCacheKeys()
+        with patch.object(app, "get_cached_gsc_entry", return_value=None), \
+                patch.object(app, "database_gsc_entry", return_value=None), \
+                patch.object(app, "find_live_gsc_entry", return_value=sentinel) as resolver:
+            entry = app.find_quick_gsc_entry(memory, self.TARGET)
+        self.assertIs(entry, sentinel)
+        resolver.assert_called_once_with(memory, self.TARGET, force_scan=True)
+
+    def test_unreadable_alias_candidate_falls_back_to_verified_object(self):
+        obj_size = 0x1000
+        alias_va = 0xA5BD80E0
+        verified_va = 0x85BD80E0
+        table_ref = 0x83000008
+
+        class TableMemory(AddressedMemory):
+            def scan(self, needle, limit=128):
+                return [table_ref]
+
+            def read_u32(self, address):
+                return {table_ref - 4: obj_size, table_ref - 8: 0}[address]
+
+        memory = TableMemory({alias_va: FreshInstallResolutionTests.STALE_BYTES, verified_va: app.T6_ALPHA_VM_MAGIC})
+        candidates = app.find_table_candidates_for_object(memory, alias_va, obj_size, "scan", verified_va=verified_va)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["object_va"], verified_va)
+        self.assertEqual(candidates[0]["buffer_va"], table_ref)
+
+        readable = TableMemory({alias_va: app.T6_ALPHA_VM_MAGIC})
+        candidates = app.find_table_candidates_for_object(readable, alias_va, obj_size, "scan", verified_va=verified_va)
+        self.assertEqual(candidates[0]["object_va"], alias_va)
 
 
 if __name__ == "__main__":

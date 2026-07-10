@@ -540,7 +540,8 @@ def prepare_compiled_gsc_for_vm(
         raise RuntimeError(
             "Resolved target is stale or invalid; injection was blocked before writing memory. "
             f"Expected a GSC object at 0x{object_va:X}, but found {live_magic.hex(' ')}. "
-            "Restart Xenia or clear address_cache.json, then run Detect Xenia again."
+            "The game likely has not loaded this script yet: go to the MP/ZM main menu "
+            "(load the mode once if needed), then inject again."
         )
     if vm_choice == VM_AUTO:
         bytecode = adapt_compiled_gsc_to_live_vm(mem, object_va, bytecode)
@@ -935,9 +936,26 @@ def gsc_object_aliases(obj_va: int) -> list[int]:
     return aliases
 
 
-def find_table_candidates_for_object(mem: GuestMemory, obj_va: int, obj_size: int, source: str) -> list[dict]:
+def find_table_candidates_for_object(
+    mem: GuestMemory, obj_va: int, obj_size: int, source: str, verified_va: int | None = None
+) -> list[dict]:
+    """Find live table entries that reference obj_va.
+
+    obj_va may be a mirror alias of the object the caller actually verified.
+    Guest mirror translation is not guaranteed on every Xenia fork, so the
+    returned object_va must be an address this process can read a real GSC
+    object through; otherwise a broken alias would be cached and every later
+    injection would trip the pre-write guard.
+    """
     refs = [r for r in mem.scan(struct.pack(">I", obj_va), limit=256) if 0x80000000 <= r < 0xF0000000 and (r & 3) == 0]
     candidates: list[dict] = []
+    object_va = obj_va
+    if verified_va is not None and object_va != verified_va:
+        try:
+            if mem.read(object_va, len(GSC_MAGIC)) != GSC_MAGIC:
+                object_va = verified_va
+        except OSError:
+            object_va = verified_va
     for ref in refs:
         try:
             size = mem.read_u32(ref - 4)
@@ -952,7 +970,7 @@ def find_table_candidates_for_object(mem: GuestMemory, obj_va: int, obj_size: in
                     "size_va": ref - 4,
                     "buffer_va": ref,
                     "name_ptr": name_ptr,
-                    "object_va": obj_va,
+                    "object_va": object_va,
                     "object_size": obj_size,
                     "source": source,
                 }
@@ -1076,15 +1094,16 @@ def database_gsc_entry(mem: GuestMemory, target_name: str) -> dict | None:
     return None
 
 
-def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
-    cached = get_cached_gsc_entry(mem, target_name)
-    if cached is not None:
-        return cached
+def find_live_gsc_entry(mem: GuestMemory, target_name: str, force_scan: bool = False) -> dict:
+    if not force_scan:
+        cached = get_cached_gsc_entry(mem, target_name)
+        if cached is not None:
+            return cached
 
-    database_entry = database_gsc_entry(mem, target_name)
-    if database_entry is not None:
-        remember_gsc_entry(mem, target_name, database_entry)
-        return database_entry
+        database_entry = database_gsc_entry(mem, target_name)
+        if database_entry is not None:
+            remember_gsc_entry(mem, target_name, database_entry)
+            return database_entry
 
     try:
         obj_va, obj_size = find_live_gsc_object(mem, target_name)
@@ -1127,7 +1146,7 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
     tried_objects: list[int] = []
     for alias_va in gsc_object_aliases(obj_va):
         tried_objects.append(alias_va)
-        candidates.extend(find_table_candidates_for_object(mem, alias_va, obj_size, "scan"))
+        candidates.extend(find_table_candidates_for_object(mem, alias_va, obj_size, "scan", verified_va=obj_va))
     if not candidates:
         tried = ", ".join(f"0x{x:X}" for x in tried_objects)
         raise RuntimeError(f"Found {target_name} object at 0x{obj_va:X}, but no live table entry references it. Tried aliases: {tried}.")
@@ -1135,6 +1154,43 @@ def find_live_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
     entry = candidates[0]
     remember_gsc_entry(mem, target_name, entry)
     return entry
+
+
+def forget_gsc_entry(mem: GuestMemory, target_name: str) -> None:
+    cache = load_address_cache()
+    entries = cache.get("entries", {})
+    removed = False
+    for key in (mem.cache_key(target_name), mem.stable_cache_key(target_name)):
+        if key in entries:
+            del entries[key]
+            removed = True
+    if removed:
+        save_address_cache(cache)
+
+
+def resolve_entry_and_prepare_blob(
+    mem: GuestMemory, target_name: str, bytecode: bytes, vm_choice: str
+) -> tuple[dict, bytes]:
+    """Resolve the live table entry and select the output VM, self-healing once.
+
+    Cached and database addresses are validated optimistically, but a Xenia
+    fork with different guest mapping can still pass those checks through the
+    wrong host translation. If the independent pre-write guard then rejects
+    the object, the stale entry is evicted and one full scan is attempted
+    before the failure is surfaced, so users never have to clear
+    address_cache.json by hand.
+    """
+    entry = find_live_gsc_entry(mem, target_name)
+    try:
+        blob = prepare_compiled_gsc_for_vm(mem, entry["object_va"], bytecode, vm_choice)
+        return entry, blob
+    except RuntimeError:
+        if entry.get("source") == "scan":
+            raise
+        forget_gsc_entry(mem, target_name)
+        entry = find_live_gsc_entry(mem, target_name, force_scan=True)
+        blob = prepare_compiled_gsc_for_vm(mem, entry["object_va"], bytecode, vm_choice)
+        return entry, blob
 
 
 def find_quick_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
@@ -1145,10 +1201,7 @@ def find_quick_gsc_entry(mem: GuestMemory, target_name: str) -> dict:
     if database_entry is not None:
         remember_gsc_entry(mem, target_name, database_entry)
         return database_entry
-    raise RuntimeError(
-        f"Fast detect could not validate {target_name}. The script may not be mapped yet, "
-        "or this build needs the deeper scan used by Compile + Inject."
-    )
+    return find_live_gsc_entry(mem, target_name, force_scan=True)
 
 
 def _filetime_to_seconds(ft: wintypes.FILETIME) -> float:

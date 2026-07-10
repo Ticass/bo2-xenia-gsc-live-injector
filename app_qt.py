@@ -499,10 +499,9 @@ class InjectorWindow(QMainWindow):
         mem = backend.GuestMemory()
         try:
             info = mem.open()
-            live_entry = backend.find_live_gsc_entry(mem, target)
+            live_entry, blob = backend.resolve_entry_and_prepare_blob(mem, target, blob, vm_choice)
             obj = live_entry["object_va"]
             size = live_entry["object_size"]
-            blob = backend.prepare_compiled_gsc_for_vm(mem, obj, blob, vm_choice)
             blob_size = backend.object_size_from_blob(blob)
             compiled_path.write_bytes(blob)
             needed_span = max(blob_size, len(blob))
