@@ -24,6 +24,7 @@ GSC_OBJ_NAME_FIELD_OFFSET = 0x30
 GSC_OBJ_SIZE_FIELD_OFFSET = 0x24
 GSC_MAGIC = b"\x80GSC"
 MAX_RELOCATED_BLOB_SIZE = 0x200000
+MAX_INPLACE_EXPANSION_SIZE = 0x4000
 
 PROCESS_VM_READ = 0x0010
 PROCESS_VM_WRITE = 0x0020
@@ -479,6 +480,30 @@ def is_writable_guest_buffer(mem: GuestMemory, guest_va: int, size: int) -> bool
         return False
 
 
+def find_inplace_expansion_capacity(mem: GuestMemory, obj_va: int, current_size: int, needed_size: int) -> int:
+    if needed_size <= current_size:
+        return current_size
+    extra_needed = needed_size - current_size
+    if extra_needed > MAX_INPLACE_EXPANSION_SIZE:
+        return current_size
+    try:
+        padding = mem.read(obj_va + current_size, MAX_INPLACE_EXPANSION_SIZE)
+    except OSError:
+        return current_size
+    extra = 0
+    for b in padding:
+        if b != 0:
+            break
+        extra += 1
+        if extra >= extra_needed:
+            break
+    if extra < extra_needed:
+        return current_size + extra
+    if not is_writable_guest_buffer(mem, obj_va + current_size, extra_needed):
+        return current_size
+    return current_size + extra
+
+
 def find_zero_buffer_in_region(mem: GuestMemory, gva: int, region_size: int, aligned_size: int, start_va: int | None = None) -> int | None:
     chunk_size = 0x100000
     if start_va is not None and gva <= start_va < gva + region_size:
@@ -625,11 +650,7 @@ def patch_objpoints_template(user_code: str, entry_function: str) -> tuple[Path,
     text = template.read_text(encoding="utf-8", errors="replace")
     marker = "    // CODEX_OBJPOINTS_LAUNCHER"
     launcher = (
-        "    if ( !isdefined( level.codex_injector_started ) )\n"
-        "    {\n"
-        "        level.codex_injector_started = 1;\n"
-        f"        level thread {entry_function}();\n"
-        "    }"
+        f"    level thread {entry_function}();"
     )
     if marker not in text:
         raise RuntimeError("Objpoints template patch point not found.")

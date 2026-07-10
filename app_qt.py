@@ -493,7 +493,8 @@ class InjectorWindow(QMainWindow):
             live_entry = backend.find_live_gsc_entry(mem, target)
             obj = live_entry["object_va"]
             size = live_entry["object_size"]
-            if blob_size <= size:
+            needed_span = max(blob_size, len(blob))
+            if needed_span <= size:
                 backup = mem.read(obj, size)
                 backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
                 backup_path.write_bytes(backup)
@@ -512,38 +513,64 @@ class InjectorWindow(QMainWindow):
                 buffer_va = obj
             else:
                 if target.replace("\\", "/").lower() in backend.INPLACE_ONLY_TARGETS:
-                    raise RuntimeError(
-                        f"Compiled {target} is larger than the live object "
-                        f"(0x{blob_size:X} > 0x{size:X}). Relocating this MP startup target is unsafe "
-                        "on system-link map load; reduce the script size or use a larger in-place target."
-                    )
-                if blob_size > backend.MAX_RELOCATED_BLOB_SIZE:
-                    raise RuntimeError(
-                        f"Compiled blob is too large for the relocation buffer: "
-                        f"0x{blob_size:X} > 0x{backend.MAX_RELOCATED_BLOB_SIZE:X}"
-                    )
-                buffer_va = backend.find_relocation_buffer(mem, len(blob), obj)
-                mem.write(buffer_va, b"\x00" * len(blob))
-                mem.write(buffer_va, blob)
-                mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
-                mem.write(live_entry["buffer_va"], buffer_va.to_bytes(4, "big"))
-                mode = "relocated"
-                cfg = {
-                    "mode": "relocated",
-                    "target_gsc": target,
-                    "entry_va": f"0x{live_entry['entry_va']:X}",
-                    "size_va": f"0x{live_entry['size_va']:X}",
-                    "buffer_va": f"0x{live_entry['buffer_va']:X}",
-                    "old_size": f"0x{size:X}",
-                    "old_buffer": f"0x{obj:X}",
-                    "new_size": f"0x{blob_size:X}",
-                    "new_buffer": f"0x{buffer_va:X}",
-                    "object_va": f"0x{obj:X}",
-                    "object_size": f"0x{size:X}",
-                    "compiled_file": str(compiled_path),
-                    "script_len": f"0x{blob_size:X}",
-                    "file_len": f"0x{len(blob):X}",
-                }
+                    capacity = backend.find_inplace_expansion_capacity(mem, obj, size, needed_span)
+                    if needed_span <= capacity:
+                        backup = mem.read(obj, capacity)
+                        backup_path = backend.user_dir() / "build" / f"backup_{target_mode.lower()}_{obj:X}.bin"
+                        backup_path.write_bytes(backup)
+                        mem.write(obj, blob + (b"\x00" * (capacity - len(blob))))
+                        mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
+                        mode = "expanded in-place"
+                        cfg = {
+                            "mode": "expanded-inplace",
+                            "target_gsc": target,
+                            "entry_va": f"0x{live_entry['entry_va']:X}",
+                            "size_va": f"0x{live_entry['size_va']:X}",
+                            "object_va": f"0x{obj:X}",
+                            "object_size": f"0x{size:X}",
+                            "expanded_size": f"0x{capacity:X}",
+                            "old_size": f"0x{size:X}",
+                            "new_size": f"0x{blob_size:X}",
+                            "backup_file": str(backup_path),
+                            "compiled_file": str(compiled_path),
+                            "script_len": f"0x{blob_size:X}",
+                            "file_len": f"0x{len(blob):X}",
+                        }
+                        buffer_va = obj
+                    else:
+                        raise RuntimeError(
+                            f"Compiled {target} is larger than the live object "
+                            f"(0x{blob_size:X} > 0x{size:X}). Only 0x{capacity - size:X} bytes of safe "
+                            "zero padding were found after the object, and relocation is unsafe on system-link map load."
+                        )
+                else:
+                    if blob_size > backend.MAX_RELOCATED_BLOB_SIZE:
+                        raise RuntimeError(
+                            f"Compiled blob is too large for the relocation buffer: "
+                            f"0x{blob_size:X} > 0x{backend.MAX_RELOCATED_BLOB_SIZE:X}"
+                        )
+                    buffer_va = backend.find_relocation_buffer(mem, len(blob), obj)
+                    mem.write(buffer_va, b"\x00" * len(blob))
+                    mem.write(buffer_va, blob)
+                    mem.write(live_entry["size_va"], blob_size.to_bytes(4, "big"))
+                    mem.write(live_entry["buffer_va"], buffer_va.to_bytes(4, "big"))
+                    mode = "relocated"
+                    cfg = {
+                        "mode": "relocated",
+                        "target_gsc": target,
+                        "entry_va": f"0x{live_entry['entry_va']:X}",
+                        "size_va": f"0x{live_entry['size_va']:X}",
+                        "buffer_va": f"0x{live_entry['buffer_va']:X}",
+                        "old_size": f"0x{size:X}",
+                        "old_buffer": f"0x{obj:X}",
+                        "new_size": f"0x{blob_size:X}",
+                        "new_buffer": f"0x{buffer_va:X}",
+                        "object_va": f"0x{obj:X}",
+                        "object_size": f"0x{size:X}",
+                        "compiled_file": str(compiled_path),
+                        "script_len": f"0x{blob_size:X}",
+                        "file_len": f"0x{len(blob):X}",
+                    }
             cfg_path = backend.user_dir() / "last_injection.json"
             cfg_path.write_text(json.dumps(cfg, indent=2))
             self.restore_cfg = cfg_path
@@ -590,6 +617,8 @@ class InjectorWindow(QMainWindow):
             else:
                 backup = Path(cfg["backup_file"]).read_bytes()
                 mem.write(int(cfg["object_va"], 16), backup)
+                if cfg.get("mode") == "expanded-inplace" and cfg.get("size_va") and cfg.get("old_size"):
+                    mem.write(int(cfg["size_va"], 16), int(cfg["old_size"], 16).to_bytes(4, "big"))
                 self.signals.log.emit(f"{info}\nRestored {cfg['target_gsc']} at {cfg['object_va']}.")
         finally:
             mem.close()

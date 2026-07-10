@@ -26,7 +26,7 @@ The tool preserves the stock `_callbacksetup.gsc` template for the selected mode
 For the MP `_globallogic_player.gsc` fallback, the tool preserves the stock player gametype logic and inserts the entry thread inside `_globallogic_player::callback_playerconnect()` instead. `_objpoints.gsc` remains available for diagnostics, but the app blocks relocated MP startup-target injections because they can crash during system-link map load.
 When multiple Xenia processes are open, the injector checks each one and connects to the process that actually has an Xbox guest image mapped.
 
-Small compiled scripts are written in place after backing up the original object. Larger compiled scripts are relocated to a free guest-memory buffer and the live GSC table entry is patched to point at the relocated object, including its new size.
+Small compiled scripts are written in place after backing up the original object. MP startup targets can also expand in place into verified writable zero padding, keeping the same object pointer and updating only the live size field. Larger compiled scripts are relocated to a free guest-memory buffer and the live GSC table entry is patched to point at the relocated object, including its new size.
 Compiled objects are normalized after the internal script name is added so the GSC header size fields match the final blob length before injection.
 
 ## Interface
