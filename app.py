@@ -675,8 +675,8 @@ def run_gsc_tool_compile(source: Path, output_name: str) -> bytes:
 
 SCRIPT_TARGETS = {
     ("ZM", "_callbacksetup.gsc"): "maps/mp/gametypes_zm/_callbacksetup.gsc",
-    ("MP", "_callbacksetup.gsc"): "maps/mp/gametypes/_callbacksetup.gsc",
     ("MP", "_objpoints.gsc"): "maps/mp/gametypes/_objpoints.gsc",
+    ("MP", "_callbacksetup.gsc"): "maps/mp/gametypes/_callbacksetup.gsc",
 }
 
 def script_choices_for_game_type(game_type: str) -> list[str]:

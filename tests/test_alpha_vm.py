@@ -51,7 +51,7 @@ class AlphaVmTests(unittest.TestCase):
     def test_only_requested_script_targets_are_exposed(self):
         self.assertEqual(
             app.script_choices_for_game_type("MP"),
-            ["_callbacksetup.gsc", "_objpoints.gsc"],
+            ["_objpoints.gsc", "_callbacksetup.gsc"],
         )
         self.assertEqual(app.script_choices_for_game_type("ZM"), ["_callbacksetup.gsc"])
 
