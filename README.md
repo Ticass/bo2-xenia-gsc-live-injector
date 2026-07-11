@@ -6,7 +6,7 @@ Current flow:
 
 1. Launch Xenia and reach the MP or Zombies main menu.
 2. Choose `ZM` or `MP`.
-3. MP injects into `_objpoints.gsc`; ZM injects into `_callbacksetup.gsc`.
+3. Choose `_objpoints.gsc` for the July 20, 2012 MP Alpha build, or `_callbacksetup.gsc` for retail MP/ZM.
 4. Write GSC functions in the editor. The default entry function is `codex_main`.
 5. Click `Compile + Inject`.
 6. Load or restart the map.
@@ -29,10 +29,11 @@ Auto remains the default. Forced modes select the compiler output revision but
 still require the resolved address to contain a real `80 47 53 43` GSC object;
 they never bypass stale-address protection.
 
-Larger scripts are relocated in the same way as other supported builds after
-compiler/VM compatibility is validated. The earlier Alpha map-load freeze was
-caused by revision-6 bytecode being passed to its revision-5 VM, not by
-relocation.
+`_objpoints.gsc` is the injection target for this Alpha build only — the
+Alpha does not load `_callbacksetup.gsc`. Larger scripts are relocated in the
+same way as other supported builds after compiler/VM compatibility is
+validated. The earlier Alpha map-load freeze was caused by revision-6 bytecode
+being passed to its revision-5 VM, not by relocation.
 
 ## Freeze Probe
 
@@ -45,7 +46,7 @@ Documents\BO2 GSC Live Injector\freeze_reports
 
 The probe samples the live GSC table entry, object pointer, object size/name, Xenia process CPU time, the last injection config, and recent Xenia log output. Send the `.txt` summary first; keep the matching `.json` file for deeper debugging.
 
-The tool preserves the stock template for the selected target (`_objpoints.gsc` for MP, `_callbacksetup.gsc` for ZM), inserts a thread call to your entry function, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live GSC object, and injects the compiled object.
+The tool preserves the stock template for the selected target (`_objpoints.gsc` for the July 2012 MP Alpha, `_callbacksetup.gsc` for retail MP/ZM), inserts a thread call to your entry function, compiles through bundled `gsc-tool`, scans the running Xenia guest memory for the live GSC object, and injects the compiled object.
 When multiple Xenia processes are open, the injector checks each one and connects to the process that actually has an Xbox guest image mapped.
 
 Small compiled scripts are written in place after backing up the original object. Larger compiled scripts are relocated to a free guest-memory buffer and the live GSC table entry is patched to point at the relocated object, including its new size.
